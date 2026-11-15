@@ -38,6 +38,7 @@ pub struct PluginHostState {
     pub plugin_name: String,
     pub data_folder: PathBuf,
     pub plugin: Option<Weak<WasmPlugin>>,
+    pub tasks: super::scheduler::Tasks,
 }
 
 impl Default for PluginHostState {
@@ -73,6 +74,7 @@ impl PluginHostState {
             plugin_name,
             data_folder,
             plugin: None,
+            tasks: super::scheduler::Tasks::default(),
         }
     }
 
