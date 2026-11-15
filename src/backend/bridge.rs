@@ -447,6 +447,9 @@ impl BackendBridge {
     }
 
     /// Establishes connection to backend, handles login handshake, and tunnels packets
+    ///
+    /// Returns `Err` only if the player never reached a backend. Once they have, every
+    /// exit goes through the end of this function, which fires `player-disconnect`.
     pub async fn run<R, W>(
         self,
         mut client_decoder: TCPNetworkDecoder<R>,
