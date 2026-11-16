@@ -997,6 +997,7 @@ struct PendingSuggestion {
 /// Acknowledged. That is when the login is acknowledged on the backend, instead of passing the
 /// client's packet through, which the backend can't handle in the login state. Play packets the
 /// client sends before its acknowledgement are dropped, as they belong to the old server.
+#[allow(clippy::too_many_arguments)]
 async fn reenter_configuration<R, W, B>(
     client_version: JavaMinecraftVersion,
     backend_version: JavaMinecraftVersion,
@@ -1876,6 +1877,8 @@ mod tests {
         let plugins_dir = tempfile::tempdir().unwrap();
         let plugin_manager = PluginManager::new(plugins_dir.path().to_path_buf()).unwrap();
         let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
+        #[cfg(not(feature = "legacy-clients"))]
+        let _ = &legacy;
 
         let tunnel = BackendBridge::bridge_tunnel(
             "tester",
@@ -1970,6 +1973,83 @@ mod tests {
                 (0x02, string_payload("/spawn")),
             ]
         );
+    }
+
+    #[cfg(feature = "legacy-clients")]
+    #[tokio::test]
+    async fn old_client_is_translated_both_ways() {
+        use crate::protocol::legacy_ids::{clientbound, serverbound};
+
+        // 1.12.2 against a current backend: the backend's system chat becomes 1.12.2's chat
+        // (0x0f), and the client's chat (0x02) reaches the backend with the current id.
+        let version = JavaMinecraftVersion::V_1_12_2;
+        let session = legacy::Session::new(version, uuid::Uuid::new_v4()).unwrap();
+        session.reset(ConnectionState::Play);
+        let (exit, to_backend) = run_tunnel(version, Some(session), |mut peers| async move {
+            let text = TextComponent::text("hi");
+            let mut chat = Vec::new();
+            CSystemChatMessage::new(&text, false)
+                .write_packet_data(&mut chat, &pumpkin_data::packet::CURRENT_MC_VERSION)
+                .unwrap();
+            peers
+                .send_from_backend(packet_bytes(
+                    clientbound::play::SYSTEM_CHAT.current(),
+                    &chat,
+                ))
+                .await;
+            assert_eq!(peers.next_to_client().await.id, 0x0f);
+
+            peers
+                .send_from_client(packet_bytes(0x02, &string_payload("hello")))
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let reason = TextComponent::text("bye");
+            let mut disconnect = Vec::new();
+            CPlayDisconnect::new(&reason)
+                .write_packet_data(&mut disconnect, &pumpkin_data::packet::CURRENT_MC_VERSION)
+                .unwrap();
+            peers
+                .send_from_backend(packet_bytes(
+                    clientbound::play::DISCONNECT.current(),
+                    &disconnect,
+                ))
+                .await;
+            peers
+        })
+        .await;
+        match exit {
+            TunnelExit::BackendDisconnected { reason } => {
+                assert_eq!(reason.as_deref(), Some("bye"));
+            }
+            other => panic!("unexpected exit: {other:?}"),
+        }
+        assert_eq!(to_backend.len(), 1);
+        assert_eq!(to_backend[0].id, serverbound::play::CHAT.current());
+        let mut payload = &to_backend[0].payload[..];
+        assert_eq!(&*payload.get_str().unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn pre_1_13_tab_completion_is_answered_by_vine() {
+        // 1.8: tab complete is 0x14 (text, has position) and its answer 0x3a.
+        let version = JavaMinecraftVersion::V_1_8;
+        let (exit, to_backend) = run_tunnel(version, None, |mut peers| async move {
+            let mut request = string_payload("/he");
+            request.push(0);
+            peers.send_from_client(packet_bytes(0x14, &request)).await;
+            let answer = peers.next_to_client().await;
+            assert_eq!(answer.id, 0x3a);
+            let mut cur = &answer.payload[..];
+            assert_eq!(cur.get_var_int().unwrap().0, 1);
+            assert_eq!(&*cur.get_str().unwrap(), "/help");
+            peers
+                .send_from_backend(packet_bytes(0x40, &string_payload("\"bye\"")))
+                .await;
+            peers
+        })
+        .await;
+        assert!(matches!(exit, TunnelExit::BackendDisconnected { .. }));
+        assert!(to_backend.is_empty(), "the old request reached the backend");
     }
 
     #[test]

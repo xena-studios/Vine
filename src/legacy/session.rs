@@ -479,3 +479,243 @@ fn added_players(mut payload: &[u8]) -> Vec<Uuid> {
     }
     players
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_protocol::java::client::play::{CLogin, CPlayerPosition};
+    use pumpkin_util::math::vector3::Vector3;
+
+    const V1_8: JavaMinecraftVersion = JavaMinecraftVersion::V_1_8;
+    const V1_12_2: JavaMinecraftVersion = JavaMinecraftVersion::V_1_12_2;
+    const V1_20_4: JavaMinecraftVersion = JavaMinecraftVersion::V_1_20_3;
+
+    fn session(version: JavaMinecraftVersion) -> Arc<Session> {
+        Session::new(version, Uuid::new_v4()).expect("translated")
+    }
+
+    fn current(packet: &impl ClientPacket) -> Vec<u8> {
+        let mut out = Vec::new();
+        packet
+            .write_packet_data(&mut out, &CURRENT_MC_VERSION)
+            .unwrap();
+        out
+    }
+
+    fn login(dimension: Dimension) -> Vec<u8> {
+        let names = vec!["minecraft:overworld".to_string()];
+        current(&CLogin {
+            entity_id: 7,
+            is_hardcore: false,
+            dimension_names: &names,
+            max_players: VarInt(20),
+            view_distance: VarInt(10),
+            simulated_distance: VarInt(10),
+            reduced_debug_info: false,
+            enabled_respawn_screen: true,
+            limited_crafting: false,
+            spawn_data: PlayerSpawnData::new(
+                dimension,
+                42,
+                1,
+                -1,
+                false,
+                false,
+                None,
+                VarInt(0),
+                VarInt(63),
+            ),
+            online_mode: false,
+            enforce_secure_chat: false,
+        })
+    }
+
+    fn ids(translated: &Translated) -> Vec<i32> {
+        translated.to_client.iter().map(|(id, _)| *id).collect()
+    }
+
+    fn first_id(frame: &Bytes) -> i32 {
+        (&frame[..]).get_var_int().unwrap().0
+    }
+
+    #[test]
+    fn join_on_1_8_is_its_join_game() {
+        let s = session(V1_8);
+        s.reset(ConnectionState::Login);
+        let out = s.clientbound(
+            clientbound::play::LOGIN.current(),
+            &login(Dimension::OVERWORLD),
+        );
+        assert!(out.play);
+        // 1.8: Join Game is 0x01; no tags before 1.13.
+        assert_eq!(ids(&out), vec![0x01]);
+    }
+
+    #[test]
+    fn switch_on_1_8_respawns_through_another_dimension() {
+        let s = session(V1_8);
+        s.reset(ConnectionState::Play);
+        let _ = s.clientbound(
+            clientbound::play::LOGIN.current(),
+            &login(Dimension::OVERWORLD),
+        );
+
+        s.begin_switch();
+        // The old server's packets are dropped until the new join packet.
+        assert!(s.serverbound(0x00, &[0x01]).is_empty());
+        s.reset(ConnectionState::Config);
+        let out = s.clientbound(
+            clientbound::play::LOGIN.current(),
+            &login(Dimension::OVERWORLD),
+        );
+        // Join Game, then Respawn (0x07) into the nether (-1) and back into the overworld (0).
+        assert_eq!(ids(&out), vec![0x01, 0x07, 0x07]);
+        assert_eq!(&out.to_client[1].1[..4], &(-1i32).to_be_bytes());
+        assert_eq!(&out.to_client[2].1[..4], &0i32.to_be_bytes());
+        // Keep alive (0x00 on 1.8) passes again.
+        assert_eq!(s.serverbound(0x00, &[0x01]).len(), 1);
+    }
+
+    #[test]
+    fn switch_removes_the_old_tab_list() {
+        let s = session(V1_12_2);
+        s.reset(ConnectionState::Play);
+        let _ = s.clientbound(
+            clientbound::play::LOGIN.current(),
+            &login(Dimension::OVERWORLD),
+        );
+        let player = Uuid::new_v4();
+        let mut add = vec![PlayerInfoFlags::ADD_PLAYER.bits()];
+        add.write_var_int(&VarInt(1)).unwrap();
+        add.write_uuid(&player).unwrap();
+        add.write_string("other").unwrap();
+        add.write_var_int(&VarInt(0)).unwrap();
+        let _ = s.clientbound(clientbound::play::PLAYER_INFO_UPDATE.current(), &add);
+
+        s.begin_switch();
+        let out = s.clientbound(
+            clientbound::play::LOGIN.current(),
+            &login(Dimension::OVERWORLD),
+        );
+        // 1.12.2: Player List Item (0x2e) removing the player, Join Game (0x23), two Respawns
+        // (0x35).
+        assert_eq!(ids(&out), vec![0x2e, 0x23, 0x35, 0x35]);
+        let mut remove = &out.to_client[0].1[..];
+        assert_eq!(remove.get_var_int().unwrap().0, 4);
+        assert_eq!(remove.get_var_int().unwrap().0, 1);
+        assert_eq!(remove.get_uuid().unwrap(), player);
+    }
+
+    #[test]
+    fn configuration_follows_the_client_acknowledgements() {
+        let s = session(V1_20_4);
+        s.reset(ConnectionState::Login);
+        // Login Acknowledged is 0x03 on 1.20.4 too.
+        let ack = s.serverbound(0x03, &[]);
+        assert_eq!(
+            ack.iter().map(first_id).collect::<Vec<_>>(),
+            vec![serverbound::login::LOGIN_ACKNOWLEDGED.current()]
+        );
+        let finish = s.clientbound(clientbound::config::FINISH_CONFIGURATION.current(), &[]);
+        assert!(!finish.play);
+        assert_eq!(ids(&finish), vec![0x02]);
+        // Finish Configuration acknowledged (0x02 on 1.20.4), then play.
+        let done = s.serverbound(0x02, &[]);
+        assert_eq!(
+            done.iter().map(first_id).collect::<Vec<_>>(),
+            vec![serverbound::config::FINISH_CONFIGURATION.current()]
+        );
+        let out = s.clientbound(
+            clientbound::play::LOGIN.current(),
+            &login(Dimension::OVERWORLD),
+        );
+        assert!(out.play);
+        // Join (0x29 on 1.20.4); its tags came in configuration.
+        assert_eq!(ids(&out), vec![0x29]);
+    }
+
+    fn teleport(id: i32) -> Vec<u8> {
+        current(&CPlayerPosition::new(
+            VarInt(id),
+            Vector3::new(0.5, 64.0, 0.5),
+            Vector3::new(0.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            Vec::new(),
+        ))
+    }
+
+    #[test]
+    fn teleports_are_confirmed_for_1_8_on_its_next_move() {
+        let s = session(V1_8);
+        s.reset(ConnectionState::Play);
+        let _ = s.clientbound(clientbound::play::PLAYER_POSITION.current(), &teleport(5));
+        // 1.8 Player Position (0x04): x, feet y, z, on ground.
+        let mut position = Vec::new();
+        for v in [0.5f64, 64.0, 0.5] {
+            position.extend_from_slice(&v.to_be_bytes());
+        }
+        position.push(1);
+        let out = s.serverbound(0x04, &position);
+        assert_eq!(
+            out.iter().map(first_id).collect::<Vec<_>>(),
+            vec![
+                serverbound::play::ACCEPT_TELEPORTATION.current(),
+                serverbound::play::MOVE_PLAYER_POS.current(),
+            ]
+        );
+        let mut confirm = &out[0][..];
+        confirm.get_var_int().unwrap();
+        assert_eq!(confirm.get_var_int().unwrap().0, 5);
+        // Only once.
+        assert_eq!(s.serverbound(0x04, &position).len(), 1);
+    }
+
+    #[test]
+    fn only_the_latest_teleport_confirmation_is_forwarded() {
+        let s = session(V1_12_2);
+        s.reset(ConnectionState::Play);
+        let _ = s.clientbound(clientbound::play::PLAYER_POSITION.current(), &teleport(1));
+        let _ = s.clientbound(clientbound::play::PLAYER_POSITION.current(), &teleport(2));
+        // 1.12.2 Teleport Confirm is 0x00.
+        assert!(s.serverbound(0x00, &[1]).is_empty());
+        assert_eq!(s.serverbound(0x00, &[2]).len(), 1);
+        assert!(s.serverbound(0x00, &[2]).is_empty());
+    }
+
+    #[test]
+    fn chunk_batches_are_acknowledged_for_clients_before_1_20_2() {
+        let old = session(V1_12_2);
+        old.reset(ConnectionState::Play);
+        let out = old.clientbound(clientbound::play::CHUNK_BATCH_FINISHED.current(), &[1]);
+        assert!(out.to_client.is_empty());
+        assert_eq!(
+            out.to_backend.iter().map(first_id).collect::<Vec<_>>(),
+            vec![serverbound::play::CHUNK_BATCH_RECEIVED.current()]
+        );
+
+        let new = session(V1_20_4);
+        new.reset(ConnectionState::Play);
+        let out = new.clientbound(clientbound::play::CHUNK_BATCH_FINISHED.current(), &[1]);
+        assert!(out.to_backend.is_empty());
+        assert_eq!(out.to_client.len(), 1);
+    }
+
+    #[test]
+    fn login_success_is_translated() {
+        let s = session(V1_8);
+        let uuid = Uuid::new_v4();
+        let mut payload = Vec::new();
+        payload.write_uuid(&uuid).unwrap();
+        payload.write_string("mx").unwrap();
+        payload.write_var_int(&VarInt(0)).unwrap();
+        payload.write_uuid(&Uuid::new_v4()).unwrap(); // session id, since 26.2
+        let packet = frame(clientbound::login::LOGIN_FINISHED.current(), &payload);
+        let out = s.login_success(&packet).unwrap();
+        let mut cur = &out[..];
+        assert_eq!(cur.get_var_int().unwrap().0, 0x02);
+        // 1.8: the UUID as a dashed string, then the name.
+        assert_eq!(&*cur.get_str().unwrap(), uuid.to_string());
+        assert_eq!(&*cur.get_str().unwrap(), "mx");
+    }
+}
