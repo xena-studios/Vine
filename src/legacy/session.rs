@@ -449,7 +449,10 @@ fn disguised_chat_as_system(mut payload: &[u8]) -> Option<Vec<u8>> {
     let text = if sender.clone().get_text().is_empty() {
         message
     } else {
-        TextComponent::translate("chat.type.text", [sender, message])
+        TextComponent::text("<")
+            .add_child(sender)
+            .add_text("> ")
+            .add_child(message)
     };
     let mut out = Vec::new();
     CSystemChatMessage::new(&text, false)
@@ -741,17 +744,14 @@ mod tests {
         assert_eq!(ids(&out), vec![0x02]);
         let mut cur = &out.to_client[0].1[..];
         let json = cur.get_str().unwrap();
-        assert!(
-            json.contains("chat.type.text") && json.contains("hello"),
-            "{json}"
-        );
+        assert!(json.contains("mx") && json.contains("hello"), "{json}");
     }
 
     #[test]
     fn section_updates_become_block_updates_before_1_16() {
         use pumpkin_protocol::codec::var_long::VarLong;
         // Section (1, 4, -1); blocks at local (2, 3, 4) and (0, 0, 0), states 1 and 9.
-        let section: i64 = (1 << 42) | ((-1i64 & 0x3F_FFFF) << 20) | 4;
+        let section: i64 = (1 << 42) | (0x3F_FFFF << 20) | 4;
         let mut payload = section.to_be_bytes().to_vec();
         payload.write_var_int(&VarInt(2)).unwrap();
         payload
