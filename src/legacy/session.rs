@@ -205,6 +205,20 @@ impl Session {
     pub fn clientbound(&self, id: i32, payload: &[u8]) -> Translated {
         let mut st = self.lock();
         let state = st.connection.unwrap_or(ConnectionState::Play);
+        if state == ConnectionState::Config
+            && id == clientbound::config::SELECT_KNOWN_PACKS.current()
+            && self.version < JavaMinecraftVersion::V_1_20_5
+        {
+            // Known packs arrived in 1.20.5: answer for the client, which can't.
+            return Translated {
+                to_client: Vec::new(),
+                to_backend: vec![frame(
+                    serverbound::config::SELECT_KNOWN_PACKS.current(),
+                    payload,
+                )],
+                play: false,
+            };
+        }
         if state != ConnectionState::Play {
             let to_client = PacketTranslator::translate_connection_outgoing(
                 state_name(state),
@@ -632,6 +646,19 @@ mod tests {
         assert!(out.play);
         // Join (0x29 on 1.20.4); its tags came in configuration.
         assert_eq!(ids(&out), vec![0x29]);
+    }
+
+    #[test]
+    fn known_packs_are_answered_for_1_20_4() {
+        let s = session(V1_20_4);
+        s.reset(ConnectionState::Config);
+        let packs = [0u8];
+        let out = s.clientbound(clientbound::config::SELECT_KNOWN_PACKS.current(), &packs);
+        assert!(out.to_client.is_empty());
+        assert_eq!(
+            out.to_backend.iter().map(first_id).collect::<Vec<_>>(),
+            vec![serverbound::config::SELECT_KNOWN_PACKS.current()]
+        );
     }
 
     fn teleport(id: i32) -> Vec<u8> {
