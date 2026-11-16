@@ -11,6 +11,8 @@ pumpkin-util = { path = "../Pumpkin/crates/pumpkin-util" }
 pumpkin-auth = { path = "../Pumpkin/crates/pumpkin-auth" }
 pumpkin-command = { path = "../Pumpkin/crates/pumpkin-command" }
 pumpkin-plugin-runtime = { path = "../Pumpkin/crates/pumpkin-plugin-runtime" }
+# Translation for clients older than the current version (see `src/legacy`).
+pumpkin-java-multiversion = { path = "../pumpkin-java-multiversion", default-features = false, optional = true }
 wasmtime = { version = "50.0.1", default-features = false, features = ["runtime", "component-model", "component-model-async", "async", "cache", "cranelift", "gc", "gc-drc", "threads", "std"] }
 wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2", "p3"] }
 wasmtime-wasi-http = { version = "50.0.1", default-features = false, features = ["p2", "default-send-request"] }
@@ -45,6 +47,12 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no
 
 # Telemetry & System Info
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+[features]
+default = ["legacy-clients"]
+# Translate clients older than the current version on the proxy, so backends only see the
+# current version.
+legacy-clients = ["dep:pumpkin-java-multiversion"]
 
 [dev-dependencies]
 tempfile = "3"
