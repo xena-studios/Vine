@@ -9,9 +9,12 @@ use pumpkin_data::packet::CURRENT_MC_VERSION;
 use pumpkin_java_multiversion::packet::translator::{JavaConnectionState, PacketTranslator};
 use pumpkin_java_multiversion::translate::{chunk, entity_data, tags};
 use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::java::client::play::{CRespawn, PlayerInfoFlags, PlayerSpawnData};
+use pumpkin_protocol::java::client::play::{
+    CRespawn, CSystemChatMessage, PlayerInfoFlags, PlayerSpawnData,
+};
 use pumpkin_protocol::ser::{NetworkReadExt, NetworkReadSliceExt, NetworkWriteExt};
 use pumpkin_protocol::{ClientPacket, ConnectionState};
+use pumpkin_util::text::TextComponent;
 use pumpkin_util::version::JavaMinecraftVersion;
 use tracing::debug;
 use uuid::Uuid;
@@ -281,6 +284,19 @@ impl Session {
             }
         }
 
+        if id == clientbound::play::DISGUISED_CHAT.current() {
+            // Pumpkin's player chat. Older layouts differ (and before 1.19.3 there is no such
+            // packet), so the client gets it as a system message: "<sender> message".
+            if let Some(chat) = disguised_chat_as_system(payload) {
+                self.translate_play(
+                    clientbound::play::SYSTEM_CHAT.current(),
+                    &chat,
+                    &mut out.to_client,
+                );
+            }
+            return out;
+        }
+
         self.translate_play(id, payload, &mut out.to_client);
         out
     }
@@ -408,6 +424,19 @@ fn join_spawn_data(mut payload: &[u8]) -> Option<PlayerSpawnData> {
     payload.get_bool().ok()?; // respawn screen
     payload.get_bool().ok()?; // limited crafting
     PlayerSpawnData::read(&mut payload, &CURRENT_MC_VERSION).ok()
+}
+
+/// A 26.3 `DISGUISED_CHAT` as the 26.3 `SYSTEM_CHAT` vanilla's chat type renders it as.
+fn disguised_chat_as_system(mut payload: &[u8]) -> Option<Vec<u8>> {
+    let message = payload.get_component(&CURRENT_MC_VERSION).ok()?;
+    payload.get_var_int().ok()?; // chat type
+    let sender = payload.get_component(&CURRENT_MC_VERSION).ok()?;
+    let text = TextComponent::translate("chat.type.text", [sender, message]);
+    let mut out = Vec::new();
+    CSystemChatMessage::new(&text, false)
+        .write_packet_data(&mut out, &CURRENT_MC_VERSION)
+        .ok()?;
+    Some(out)
 }
 
 /// The 26.3 payload of a teleport confirmation: the id, then position and rotation, which
@@ -646,6 +675,30 @@ mod tests {
         assert!(out.play);
         // Join (0x29 on 1.20.4); its tags came in configuration.
         assert_eq!(ids(&out), vec![0x29]);
+    }
+
+    #[test]
+    fn player_chat_reaches_1_8_as_chat() {
+        use pumpkin_protocol::java::client::play::CDisguisedChatMessage;
+        let s = session(V1_8);
+        s.reset(ConnectionState::Play);
+        let message = TextComponent::text("hello");
+        let sender = TextComponent::text("mx");
+        let chat = current(&CDisguisedChatMessage::new(
+            &message,
+            VarInt(1),
+            &sender,
+            None,
+        ));
+        let out = s.clientbound(clientbound::play::DISGUISED_CHAT.current(), &chat);
+        // 1.8 Chat Message (0x02): JSON, then the position.
+        assert_eq!(ids(&out), vec![0x02]);
+        let mut cur = &out.to_client[0].1[..];
+        let json = cur.get_str().unwrap();
+        assert!(
+            json.contains("chat.type.text") && json.contains("hello"),
+            "{json}"
+        );
     }
 
     #[test]
