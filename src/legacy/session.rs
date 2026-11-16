@@ -284,6 +284,19 @@ impl Session {
             }
         }
 
+        if id == clientbound::play::SECTION_BLOCKS_UPDATE.current()
+            && self.version < JavaMinecraftVersion::V_1_16
+        {
+            // The translation has no older multi-block layout yet: one block update each.
+            for update in section_as_block_updates(payload) {
+                self.translate_play(
+                    clientbound::play::BLOCK_UPDATE.current(),
+                    &update,
+                    &mut out.to_client,
+                );
+            }
+            return out;
+        }
         if id == clientbound::play::DISGUISED_CHAT.current() {
             // Pumpkin's player chat. Older layouts differ (and before 1.19.3 there is no such
             // packet), so the client gets it as a system message: "<sender> message".
@@ -437,6 +450,33 @@ fn disguised_chat_as_system(mut payload: &[u8]) -> Option<Vec<u8>> {
         .write_packet_data(&mut out, &CURRENT_MC_VERSION)
         .ok()?;
     Some(out)
+}
+
+/// A 26.3 `SECTION_BLOCKS_UPDATE` as 26.3 `BLOCK_UPDATE` payloads.
+fn section_as_block_updates(mut payload: &[u8]) -> Vec<Vec<u8>> {
+    let Ok(section) = payload.get_i64_be() else {
+        return Vec::new();
+    };
+    let (sx, sy, sz) = (section >> 42, section << 44 >> 44, section << 22 >> 42);
+    let Ok(count) = payload.get_var_int() else {
+        return Vec::new();
+    };
+    let mut updates = Vec::new();
+    for _ in 0..count.0.clamp(0, 4096) {
+        let Ok(entry) = payload.get_var_long() else {
+            break;
+        };
+        let entry = entry.0;
+        let x = sx * 16 + ((entry >> 8) & 0xF);
+        let z = sz * 16 + ((entry >> 4) & 0xF);
+        let y = sy * 16 + (entry & 0xF);
+        let position = ((x & 0x3FF_FFFF) << 38) | ((z & 0x3FF_FFFF) << 12) | (y & 0xFFF);
+        let mut update = Vec::with_capacity(13);
+        update.extend_from_slice(&position.to_be_bytes());
+        let _ = update.write_var_int(&VarInt((entry >> 12) as i32));
+        updates.push(update);
+    }
+    updates
 }
 
 /// The 26.3 payload of a teleport confirmation: the id, then position and rotation, which
@@ -699,6 +739,28 @@ mod tests {
             json.contains("chat.type.text") && json.contains("hello"),
             "{json}"
         );
+    }
+
+    #[test]
+    fn section_updates_become_block_updates_before_1_16() {
+        use pumpkin_protocol::codec::var_long::VarLong;
+        // Section (1, 4, -1); blocks at local (2, 3, 4) and (0, 0, 0), states 1 and 9.
+        let section: i64 = (1 << 42) | ((-1i64 & 0x3F_FFFF) << 20) | 4;
+        let mut payload = section.to_be_bytes().to_vec();
+        payload.write_var_int(&VarInt(2)).unwrap();
+        payload
+            .write_var_long(&VarLong((1 << 12) | (2 << 8) | (4 << 4) | 3))
+            .unwrap();
+        payload.write_var_long(&VarLong(9 << 12)).unwrap();
+        let updates = section_as_block_updates(&payload);
+        assert_eq!(updates.len(), 2);
+        let pos = i64::from_be_bytes(updates[0][..8].try_into().unwrap());
+        assert_eq!((pos >> 38, pos << 52 >> 52, pos << 26 >> 38), (18, 67, -12));
+        let s = session(V1_8);
+        s.reset(ConnectionState::Play);
+        let out = s.clientbound(clientbound::play::SECTION_BLOCKS_UPDATE.current(), &payload);
+        // 1.8 Block Change is 0x23.
+        assert_eq!(ids(&out), vec![0x23, 0x23]);
     }
 
     #[test]
