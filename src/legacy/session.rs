@@ -439,12 +439,18 @@ fn join_spawn_data(mut payload: &[u8]) -> Option<PlayerSpawnData> {
     PlayerSpawnData::read(&mut payload, &CURRENT_MC_VERSION).ok()
 }
 
-/// A 26.3 `DISGUISED_CHAT` as the 26.3 `SYSTEM_CHAT` vanilla's chat type renders it as.
+/// A 26.3 `DISGUISED_CHAT` as a 26.3 `SYSTEM_CHAT`: "<sender> message", as vanilla's chat
+/// type renders it, or the message alone when it has no sender.
 fn disguised_chat_as_system(mut payload: &[u8]) -> Option<Vec<u8>> {
     let message = payload.get_component(&CURRENT_MC_VERSION).ok()?;
     payload.get_var_int().ok()?; // chat type
     let sender = payload.get_component(&CURRENT_MC_VERSION).ok()?;
-    let text = TextComponent::translate("chat.type.text", [sender, message]);
+    // Pumpkin decorates player chat itself and leaves the sender empty.
+    let text = if sender.clone().get_text().is_empty() {
+        message
+    } else {
+        TextComponent::translate("chat.type.text", [sender, message])
+    };
     let mut out = Vec::new();
     CSystemChatMessage::new(&text, false)
         .write_packet_data(&mut out, &CURRENT_MC_VERSION)
