@@ -1,9 +1,11 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use pumpkin_util::text::TextComponent;
+
+use crate::floodgate::BedrockPlayer;
 
 /// Actions that can be dispatched to an active player's connection
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +36,22 @@ pub struct PlayerSession {
 /// Thread-safe registry of connected player sessions
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, PlayerSession>>,
+    /// Bedrock players (Floodgate handoff from Geyser) by UUID, from login until they leave.
+    bedrock: Arc<RwLock<HashMap<Uuid, Arc<BedrockPlayer>>>>,
+}
+
+/// Removes a Bedrock player from [`SessionManager`] when their connection ends.
+pub struct BedrockGuard {
+    uuid: Uuid,
+    bedrock: Arc<RwLock<HashMap<Uuid, Arc<BedrockPlayer>>>>,
+}
+
+impl Drop for BedrockGuard {
+    fn drop(&mut self) {
+        if let Ok(mut lock) = self.bedrock.write() {
+            lock.remove(&self.uuid);
+        }
+    }
 }
 
 impl Default for SessionManager {
@@ -46,7 +64,25 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            bedrock: Arc::default(),
         }
+    }
+
+    /// Records a Bedrock player until the returned guard is dropped.
+    #[must_use]
+    pub fn track_bedrock(&self, uuid: Uuid, player: Arc<BedrockPlayer>) -> BedrockGuard {
+        if let Ok(mut lock) = self.bedrock.write() {
+            lock.insert(uuid, player);
+        }
+        BedrockGuard {
+            uuid,
+            bedrock: self.bedrock.clone(),
+        }
+    }
+
+    /// The Floodgate details of a Bedrock player, or `None` for a Java player.
+    pub fn bedrock_player(&self, uuid: &Uuid) -> Option<Arc<BedrockPlayer>> {
+        self.bedrock.read().ok()?.get(uuid).cloned()
     }
 
     /// Registers a new active player session

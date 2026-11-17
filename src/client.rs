@@ -24,6 +24,7 @@ use crate::auth::{AuthenticatedPlayer, Authenticator, KeyStore};
 use crate::backend::{BackendBridge, Router};
 use crate::command::CommandDispatcher;
 use crate::config::Config;
+use crate::floodgate::{BedrockPlayer, FloodgateKey, device_os_name, separate_hostname};
 use crate::network::PrefixedRead;
 use crate::plugin::PluginManager;
 use crate::plugin::api::{
@@ -61,6 +62,10 @@ pub struct ClientHandler {
     session_manager: Arc<SessionManager>,
     command_dispatcher: Arc<CommandDispatcher>,
     plugin_manager: Arc<PluginManager>,
+    /// Floodgate's key, when `[floodgate]` is enabled.
+    floodgate: Option<Arc<FloodgateKey>>,
+    /// Refuse logins without a valid Floodgate handoff on this listener.
+    require_floodgate: bool,
 }
 
 impl ClientHandler {
@@ -88,7 +93,17 @@ impl ClientHandler {
             session_manager,
             command_dispatcher,
             plugin_manager,
+            floodgate: None,
+            require_floodgate: false,
         }
+    }
+
+    /// Reads Floodgate handoffs with `key`; with `required`, refuses logins without one.
+    #[must_use]
+    pub fn with_floodgate(mut self, key: Option<Arc<FloodgateKey>>, required: bool) -> Self {
+        self.require_floodgate = required && key.is_some();
+        self.floodgate = key;
+        self
     }
 
     pub async fn handle(
@@ -115,8 +130,15 @@ impl ClientHandler {
 
         let client_protocol = handshake.protocol_version.0 as u32;
         let client_version = JavaMinecraftVersion::from_protocol(client_protocol);
-        let raw_host = &handshake.server_address;
-        let clean_host = Sanitizer::sanitize_host(raw_host);
+        // Geyser puts Floodgate's encrypted data in the address; take it out before routing.
+        let (raw_host, floodgate_data) = match &self.floodgate {
+            Some(_) => {
+                let separated = separate_hostname(&handshake.server_address);
+                (separated.hostname, separated.data.map(ToString::to_string))
+            }
+            None => (handshake.server_address.to_string(), None),
+        };
+        let clean_host = Sanitizer::sanitize_host(&raw_host);
 
         debug!(
             "[{}] Handshake: protocol={}, resolved_version={:?}, host='{}', next_state={:?}",
@@ -135,12 +157,21 @@ impl ClientHandler {
                     .await
             }
             ConnectionState::Login => {
+                let bedrock = match self.check_floodgate(floodgate_data.as_deref()) {
+                    Ok(bedrock) => bedrock,
+                    Err(reason) => {
+                        Self::kick(&mut encoder, client_version, reason).await?;
+                        return Ok(());
+                    }
+                };
+                let client_ip = bedrock.as_ref().map_or(self.peer_addr.ip(), |b| b.ip);
                 self.handle_login(
                     decoder,
                     encoder,
                     client_version,
                     clean_host,
-                    self.peer_addr.ip(),
+                    client_ip,
+                    bedrock,
                 )
                 .await
             }
@@ -151,6 +182,49 @@ impl ClientHandler {
                 );
                 Ok(())
             }
+        }
+    }
+
+    /// Checks a login's Floodgate handoff. `Ok(None)` is a Java player; `Err` is the kick
+    /// reason for an invalid handoff, or a missing one where it's required.
+    fn check_floodgate(
+        &self,
+        data: Option<&str>,
+    ) -> Result<Option<Arc<BedrockPlayer>>, &'static str> {
+        let Some(key) = &self.floodgate else {
+            return Ok(None);
+        };
+        match data {
+            Some(data) => match BedrockPlayer::from_handoff(key, data, &self.config.floodgate) {
+                Ok(player) => {
+                    info!(
+                        "[{}] Bedrock player '{}' (xuid {}, {}, {}) via Geyser as '{}' ({})",
+                        self.peer_addr,
+                        player.data.username,
+                        player.data.xuid,
+                        device_os_name(player.data.device_os),
+                        player.data.version,
+                        player.java_username,
+                        player.java_uuid
+                    );
+                    Ok(Some(Arc::new(player)))
+                }
+                Err(e) => {
+                    warn!(
+                        "[{}] Refusing login: invalid Floodgate handoff: {}",
+                        self.peer_addr, e
+                    );
+                    Err("Invalid Bedrock handoff. Please connect through the official Geyser.")
+                }
+            },
+            None if self.require_floodgate => {
+                warn!(
+                    "[{}] Refusing login: no Floodgate handoff on a listener that requires one",
+                    self.peer_addr
+                );
+                Err("Please connect through Geyser.")
+            }
+            None => Ok(None),
         }
     }
 
@@ -229,6 +303,7 @@ impl ClientHandler {
         client_version: JavaMinecraftVersion,
         virtual_host: String,
         client_ip: IpAddr,
+        bedrock: Option<Arc<BedrockPlayer>>,
     ) -> Result<(), ClientError> {
         let login_timeout = Duration::from_secs(self.config.network.client_login_timeout_secs);
 
@@ -252,7 +327,10 @@ impl ClientHandler {
         let login_start = SLoginStart::read(&mut login_start_bytes, &client_version)
             .map_err(|e| ClientError::DecodeError(e.to_string()))?;
 
-        let username = login_start.name.to_string();
+        // A Bedrock player's name is Floodgate's Java name, not what Geyser put in Login Start.
+        let username = bedrock
+            .as_ref()
+            .map_or_else(|| login_start.name.to_string(), |b| b.java_username.clone());
 
         if self.config.runtime.is_draining() {
             info!(
@@ -292,7 +370,12 @@ impl ClientHandler {
             return Ok(());
         }
 
-        if self.config.security.validate_usernames && !Sanitizer::is_valid_username(&username) {
+        // Bedrock names carry Floodgate's prefix (`.` by default) and come from a verified
+        // handoff, so they skip the Java name check.
+        if bedrock.is_none()
+            && self.config.security.validate_usernames
+            && !Sanitizer::is_valid_username(&username)
+        {
             warn!(
                 "[{}] Rejecting invalid username '{}' (failed sanitization)",
                 self.peer_addr, username
@@ -311,7 +394,14 @@ impl ClientHandler {
             self.peer_addr, username, client_version
         );
 
-        let authenticated_player = if self.config.server.online_mode {
+        // Bedrock players were authenticated by Geyser (Xbox Live); the handoff is the proof.
+        let authenticated_player = if let Some(bedrock) = &bedrock {
+            AuthenticatedPlayer {
+                id: bedrock.java_uuid,
+                username: bedrock.java_username.clone(),
+                properties: Vec::new(),
+            }
+        } else if self.config.server.online_mode {
             let verify_token: [u8; 4] = rand::random();
             let encryption_request =
                 CEncryptionRequest::new("", self.keystore.public_key_der(), &verify_token, true);
@@ -423,6 +513,12 @@ impl ClientHandler {
         } else {
             AuthenticatedPlayer::offline(&username)
         };
+
+        // Plugins can look the Bedrock details up from `player-login` until the player leaves.
+        let _bedrock_guard = bedrock.map(|b| {
+            self.session_manager
+                .track_bedrock(authenticated_player.id, b)
+        });
 
         let mut login_event = PlayerLoginEvent {
             uuid: authenticated_player.id.to_string(),

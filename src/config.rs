@@ -67,6 +67,9 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub bedrock: crate::bedrock::BedrockConfig,
+    /// Bedrock players from Geyser, identified by Floodgate's handoff.
+    #[serde(default)]
+    pub floodgate: crate::floodgate::FloodgateConfig,
     #[serde(default)]
     pub permissions: PermissionsConfig,
     #[serde(default)]
@@ -420,6 +423,7 @@ impl Default for Config {
             servers: servers.into(),
             telemetry: TelemetryConfig::default(),
             bedrock: crate::bedrock::BedrockConfig::default(),
+            floodgate: crate::floodgate::FloodgateConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginConfig::default(),
             runtime: RuntimeState::default(),

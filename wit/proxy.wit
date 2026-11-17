@@ -1,5 +1,5 @@
 interface proxy {
-    use types.{player-info, server-info, forwarding-mode};
+    use types.{player-info, server-info, forwarding-mode, bedrock-info};
 
     /// Returns the total number of connected players.
     get-player-count: func() -> u32;
@@ -12,6 +12,10 @@ interface proxy {
 
     /// Returns information for a specific player by UUID string.
     get-player-by-uuid: func(uuid: string) -> option<player-info>;
+
+    /// The Bedrock details of a player who joined through Geyser (Floodgate handoff), from
+    /// `player-login` until they leave; `none` for a Java player.
+    get-bedrock-info: func(player-uuid: string) -> option<bedrock-info>;
 
     /// Returns a list of configured backend servers.
     get-servers: func() -> list<server-info>;

@@ -7,6 +7,25 @@ interface types {
         protocol-version: u32,
     }
 
+    /// A Bedrock player who joined through Geyser, from Floodgate's handoff.
+    record bedrock-info {
+        /// The Xbox user id.
+        xuid: string,
+        /// The Xbox gamertag, before Floodgate's prefix.
+        gamertag: string,
+        /// The device, by Floodgate's `DeviceOs` name: `Android`, `iOS`, `Windows`, `Xbox`, `PlayStation`, `Switch`, ...
+        device-os: string,
+        /// The Bedrock client's version, e.g. `1.26.60`.
+        game-version: string,
+        language-code: string,
+        /// Floodgate's `InputMode` ordinal: 0 unknown, 1 keyboard and mouse, 2 touch, 3 controller, 4 VR.
+        input-mode: u32,
+        /// Floodgate's `UiProfile` ordinal: 0 classic, 1 pocket.
+        ui-profile: u32,
+        /// Linked to a Java account, so the player has that account's name and UUID.
+        linked: bool,
+    }
+
     record server-info {
         name: string,
         address: string,

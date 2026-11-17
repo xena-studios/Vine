@@ -238,6 +238,30 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
         Ok(None)
     }
 
+    async fn get_bedrock_info(
+        &mut self,
+        player_uuid: String,
+    ) -> wasmtime::Result<Option<wit::vine::plugin::types::BedrockInfo>> {
+        let (Some(proxy), Ok(uuid)) = (&self.proxy, uuid::Uuid::parse_str(&player_uuid)) else {
+            return Ok(None);
+        };
+        Ok(proxy.session_manager.bedrock_player(&uuid).map(|b| {
+            // Geyser's `BedrockData.of` swaps the UI profile and input mode, so field 5
+            // (`ui_profile`) holds the input mode and field 6 the UI profile.
+            let ordinal = |v: i32| u32::try_from(v).unwrap_or(0);
+            wit::vine::plugin::types::BedrockInfo {
+                xuid: b.data.xuid.clone(),
+                gamertag: b.data.username.clone(),
+                device_os: crate::floodgate::device_os_name(b.data.device_os).to_string(),
+                game_version: b.data.version.clone(),
+                language_code: b.data.language_code.clone(),
+                input_mode: ordinal(b.data.ui_profile),
+                ui_profile: ordinal(b.data.input_mode),
+                linked: b.data.linked_player.is_some(),
+            }
+        }))
+    }
+
     async fn get_servers(&mut self) -> wasmtime::Result<Vec<wit::vine::plugin::types::ServerInfo>> {
         if let Some(proxy) = &self.proxy {
             let sessions = proxy.session_manager.list_sessions();

@@ -11,6 +11,7 @@ use crate::backend::Router;
 use crate::client::ClientHandler;
 use crate::command::{CommandDispatcher, CommandSender, ProxyCommandSource};
 use crate::config::Config;
+use crate::floodgate::FloodgateKey;
 use crate::network;
 use crate::security::ConnectionRateLimiter;
 use crate::session::SessionManager;
@@ -28,6 +29,8 @@ pub struct ProxyServer {
     session_manager: Arc<SessionManager>,
     command_dispatcher: Arc<CommandDispatcher>,
     plugin_manager: Arc<crate::plugin::PluginManager>,
+    /// Floodgate's key, when `[floodgate]` is enabled.
+    floodgate: Option<Arc<FloodgateKey>>,
 }
 
 impl ProxyServer {
@@ -41,6 +44,18 @@ impl ProxyServer {
             config.security.max_connections_per_sec,
             config.security.connection_burst,
         ));
+
+        let floodgate = if config.floodgate.enabled {
+            let key = FloodgateKey::load(&config.floodgate.key_file).map_err(|e| {
+                format!(
+                    "Failed to load the Floodgate key '{}': {}",
+                    config.floodgate.key_file, e
+                )
+            })?;
+            Some(Arc::new(key))
+        } else {
+            None
+        };
 
         let online_players = Arc::new(AtomicUsize::new(0));
         let session_manager = Arc::new(SessionManager::new());
@@ -88,16 +103,23 @@ impl ProxyServer {
             session_manager,
             command_dispatcher,
             plugin_manager,
+            floodgate,
         })
     }
 
     /// Run the proxy listener loop
     pub async fn run(
         &self,
-        mut shutdown_rx: broadcast::Receiver<()>,
+        shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let bind_addr = &self.config.server.bind_address;
         let listener = network::create_tcp_listener(bind_addr, &self.config.network)?;
+        let floodgate_listener = match (&self.floodgate, &self.config.floodgate.bind_address) {
+            (Some(_), Some(addr)) => {
+                Some(network::create_tcp_listener(addr, &self.config.network)?)
+            }
+            _ => None,
+        };
 
         info!("=====================================================");
         info!("  Vine Minecraft Proxy is listening on {}", bind_addr);
@@ -158,6 +180,17 @@ impl ProxyServer {
             );
         } else {
             info!("  Bedrock server-list pings: off");
+        }
+        if self.floodgate.is_some() {
+            info!(
+                "  Floodgate (Geyser) handoffs: on, prefix '{}', required on the main listener: {}",
+                self.config.floodgate.username_prefix, self.config.floodgate.required
+            );
+            if let Some(addr) = &self.config.floodgate.bind_address {
+                info!("    - Geyser-only listener on {} (handoff required)", addr);
+            }
+        } else {
+            info!("  Floodgate (Geyser) handoffs: off");
         }
         info!("=====================================================");
 
@@ -241,6 +274,51 @@ impl ProxyServer {
             }
         }
 
+        let main_listener = ListenerKind {
+            proxy_protocol: self.config.network.proxy_protocol,
+            rate_limited: true,
+            require_floodgate: self.floodgate.is_some() && self.config.floodgate.required,
+        };
+        match floodgate_listener {
+            Some(fg_listener) => {
+                let geyser_only = ListenerKind {
+                    proxy_protocol: false,
+                    rate_limited: false,
+                    require_floodgate: true,
+                };
+                tokio::join!(
+                    self.accept_loop(listener, main_listener, shutdown_rx.resubscribe()),
+                    self.accept_loop(fg_listener, geyser_only, shutdown_rx.resubscribe()),
+                );
+            }
+            None => {
+                self.accept_loop(listener, main_listener, shutdown_rx.resubscribe())
+                    .await;
+            }
+        }
+
+        info!("Vine proxy has stopped accepting connections.");
+
+        if self.config.plugins.enabled {
+            info!("Unloading plugins...");
+            self.plugin_manager.unload_plugins().await;
+        }
+
+        if let Some(handle) = telemetry_handle {
+            let timeout_secs = self.config.server.shutdown_timeout_secs.max(1);
+            let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await;
+        }
+
+        Ok(())
+    }
+
+    /// Accepts connections on one listener until shutdown.
+    async fn accept_loop(
+        &self,
+        listener: tokio::net::TcpListener,
+        kind: ListenerKind,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) {
         loop {
             tokio::select! {
                 accept_res = listener.accept() => {
@@ -256,6 +334,7 @@ impl ProxyServer {
                             let session_manager = self.session_manager.clone();
                             let command_dispatcher = self.command_dispatcher.clone();
                             let plugin_manager = self.plugin_manager.clone();
+                            let floodgate = self.floodgate.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = network::configure_client_socket(&stream, &config.network) {
@@ -266,7 +345,7 @@ impl ProxyServer {
                                 let mut effective_addr = peer_addr;
                                 let mut leftover_bytes = Vec::new();
 
-                                if config.network.proxy_protocol {
+                                if kind.proxy_protocol {
                                     match network::parse_proxy_protocol(&mut stream, peer_addr).await {
                                         Ok(Some(res)) => {
                                              effective_addr = res.client_addr;
@@ -284,7 +363,7 @@ impl ProxyServer {
                                     }
                                 }
 
-                                if !rate_limiter.check_connection(&effective_addr.ip()) {
+                                if kind.rate_limited && !rate_limiter.check_connection(&effective_addr.ip()) {
                                     warn!("[{}] Dropped connection: Rate limit exceeded", effective_addr);
                                     return;
                                 }
@@ -300,7 +379,8 @@ impl ProxyServer {
                                     session_manager,
                                     command_dispatcher,
                                     plugin_manager,
-                                );
+                                )
+                                .with_floodgate(floodgate, kind.require_floodgate);
 
                                 if let Err(err) = handler.handle(stream, leftover_bytes).await {
                                     debug!("[{}] Connection closed: {}", effective_addr, err);
@@ -319,19 +399,16 @@ impl ProxyServer {
                 }
             }
         }
-
-        info!("Vine proxy has stopped accepting connections.");
-
-        if self.config.plugins.enabled {
-            info!("Unloading plugins...");
-            self.plugin_manager.unload_plugins().await;
-        }
-
-        if let Some(handle) = telemetry_handle {
-            let timeout_secs = self.config.server.shutdown_timeout_secs.max(1);
-            let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await;
-        }
-
-        Ok(())
     }
+}
+
+/// How one listener treats its connections.
+#[derive(Clone, Copy, Debug)]
+struct ListenerKind {
+    /// Expect a PROXY protocol header first.
+    proxy_protocol: bool,
+    /// Apply the per-address connection limit.
+    rate_limited: bool,
+    /// Refuse logins without a valid Floodgate handoff.
+    require_floodgate: bool,
 }

@@ -39,6 +39,8 @@ sha2 = { version = "=0.11.0" }
 hmac = { version = "=0.13.0" }
 num-bigint = { version = "0.5" }
 base64 = { version = "0.23" }
+# Floodgate handoffs from Geyser (`src/floodgate.rs`).
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
 hex = { version = "0.4", default-features = false, features = ["std"] }
 
