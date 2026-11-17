@@ -6,6 +6,7 @@ pub mod command;
 pub mod config;
 pub mod legacy;
 pub mod network;
+pub mod packet_timing;
 pub mod permissions;
 pub mod plugin;
 pub mod protocol;

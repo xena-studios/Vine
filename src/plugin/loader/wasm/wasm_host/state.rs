@@ -168,6 +168,30 @@ impl wit::vine::plugin::command::Host for PluginHostState {
     }
 }
 
+impl wit::vine::plugin::packet_timing::Host for PluginHostState {
+    async fn take_packet_timing(
+        &mut self,
+    ) -> wasmtime::Result<Vec<wit::vine::plugin::packet_timing::PlayerPacketTiming>> {
+        let Some(proxy) = &self.proxy else {
+            return Ok(Vec::new());
+        };
+        Ok(proxy
+            .session_manager
+            .packet_timing
+            .take()
+            .into_iter()
+            .map(
+                |sample| wit::vine::plugin::packet_timing::PlayerPacketTiming {
+                    uuid: sample.uuid.to_string(),
+                    protocol_version: sample.protocol,
+                    window_ms: sample.window_ms,
+                    metrics: sample.metrics,
+                },
+            )
+            .collect())
+    }
+}
+
 impl wit::vine::plugin::proxy::Host for PluginHostState {
     async fn get_player_count(&mut self) -> wasmtime::Result<u32> {
         Ok(self

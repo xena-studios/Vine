@@ -71,6 +71,8 @@ pub struct Config {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub plugins: PluginConfig,
+    #[serde(default)]
+    pub packet_timing: PacketTimingConfig,
     /// Switches changed while the proxy runs. Not part of the file; shared by
     /// every clone of the config.
     #[serde(skip)]
@@ -93,6 +95,14 @@ impl RuntimeState {
     pub fn set_draining(&self, draining: bool) {
         self.draining.store(draining, Ordering::Release);
     }
+}
+
+/// Per-player packet timing for anticheat plugins (`packet-timing` in the plugin API).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PacketTimingConfig {
+    /// Time every player's serverbound packets (off by default).
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -420,6 +430,7 @@ impl Default for Config {
             servers: servers.into(),
             telemetry: TelemetryConfig::default(),
             bedrock: crate::bedrock::BedrockConfig::default(),
+            packet_timing: PacketTimingConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginConfig::default(),
             runtime: RuntimeState::default(),

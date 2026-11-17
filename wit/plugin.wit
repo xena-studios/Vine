@@ -11,6 +11,7 @@ world plugin {
     import context;
     import command;
     import scheduler;
+    import packet-timing;
 
     /// Called once by the host to initialize the plugin instance.
     export init-plugin: func();

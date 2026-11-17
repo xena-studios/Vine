@@ -1,0 +1,40 @@
+/// Per-player packet timing for anticheat plugins. Vine times every packet a player sends
+/// natively and hands plugins one summary per player per window, so no plugin runs per packet.
+/// Needs `[packet_timing] enabled = true` in vine.toml; otherwise `take-packet-timing` is empty.
+///
+/// Packets are read as the backend gets them (the current version for clients Vine
+/// translates). Metric names:
+///
+/// - `packets`, `packets_per_second_max`: every packet the client sent, and the most in any
+///   one second.
+/// - `swings`, `cps_max`: arm swings (left clicks), and the most in any one second.
+/// - `swing_intervals`, `swing_interval_mean_ms`, `swing_interval_stddev_ms`: gaps between
+///   swings under one second apart; mean and deviation only with at least two.
+/// - `attacks`, `attacks_per_second_max`: attack packets.
+/// - `rotations`, `rotation_snaps`, `rotation_delta_max`: packets carrying a rotation, turns of
+///   45 degrees or more in one packet, and the largest turn in degrees.
+/// - `moves`, `moves_per_second_max`: movement packets.
+/// - `ticks`, `timer_balance_max_ms`: client ticks (tick-end packets from 1.21.2, movement
+///   packets up to 1.8, none in between), and how far they ran ahead of real time, ms; the
+///   balance only when ticks were seen.
+/// - `air_rise_max`, `hover_ms_max`: most height gained in one run off the ground, blocks,
+///   and the longest time off the ground without falling, ms, from the client's on-ground flag.
+///   Declared flight is skipped; a teleport or switch starts a new run.
+///
+/// Metric names are snake_case strings so new ones need no interface change.
+interface packet-timing {
+    /// One player's packet timing over one window.
+    record player-packet-timing {
+        uuid: string,
+        /// The client's real protocol version.
+        protocol-version: u32,
+        /// How long the window ran, ms.
+        window-ms: u64,
+        metrics: list<tuple<string, f64>>,
+    }
+
+    /// Ends the window for every player and returns it, one entry per player online during it
+    /// (players who left since the last call included, once). The next window starts now.
+    /// Several plugins calling this share the windows, so one plugin should own it.
+    take-packet-timing: func() -> list<player-packet-timing>;
+}

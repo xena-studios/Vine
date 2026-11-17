@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use pumpkin_util::text::TextComponent;
 
+use crate::packet_timing::PacketTimings;
+
 /// Actions that can be dispatched to an active player's connection
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlayerAction {
@@ -34,6 +36,8 @@ pub struct PlayerSession {
 /// Thread-safe registry of connected player sessions
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, PlayerSession>>,
+    /// Packet timing per player, when `[packet_timing]` is on.
+    pub packet_timing: PacketTimings,
 }
 
 impl Default for SessionManager {
@@ -46,6 +50,7 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            packet_timing: PacketTimings::default(),
         }
     }
 

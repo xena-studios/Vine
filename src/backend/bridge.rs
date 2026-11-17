@@ -9,9 +9,9 @@ use pumpkin_protocol::java::client::login::{
     CLoginDisconnect, CLoginPluginRequest, CLoginSuccess, CSetCompression,
 };
 use pumpkin_protocol::java::client::play::{
-    ArgumentType, CCommandSuggestions, CCommands, CPlayDisconnect, CStartConfiguration,
-    CSystemChatMessage, CTransfer, ProtoNode, ProtoNodeType, StringProtoArgBehavior,
-    SuggestionProviders,
+    ArgumentType, CCommandSuggestions, CCommands, CPlayDisconnect, CPlayerPosition,
+    CStartConfiguration, CSystemChatMessage, CTransfer, ProtoNode, ProtoNodeType,
+    StringProtoArgBehavior, SuggestionProviders,
 };
 use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
 use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
@@ -42,6 +42,7 @@ use crate::command::{CommandDispatcher, CommandSender, ProxyCommandSource};
 use crate::config::{BackendConfig, Config, ForwardingMode, NetworkConfig};
 use crate::legacy;
 use crate::network;
+use crate::packet_timing::{self, PacketIds, PlayerTiming};
 use crate::plugin::PluginManager;
 use crate::plugin::api::{
     PlayerChatEvent, PlayerCommandEvent, PlayerDisconnectEvent, PlayerJoinEvent,
@@ -602,6 +603,11 @@ impl BackendBridge {
             client_ip: self.client_ip.to_string(),
             protocol_version: self.client_version.protocol_version() as u32,
         });
+        let packet_timing = self.proxy_config.packet_timing.enabled.then(|| {
+            self.session_manager
+                .packet_timing
+                .start(self.player.id, self.client_version)
+        });
 
         loop {
             let tunnel_res = Self::bridge_tunnel(
@@ -621,6 +627,7 @@ impl BackendBridge {
                 self.plugin_manager.clone(),
                 self.player.id,
                 current_server_name.clone(),
+                packet_timing.as_ref(),
             )
             .await;
 
@@ -921,6 +928,11 @@ impl BackendBridge {
             .await;
 
         self.session_manager.unregister(&self.player.username);
+        if let Some(timing) = &packet_timing {
+            self.session_manager
+                .packet_timing
+                .end(self.player.id, timing);
+        }
         self.online_players.fetch_sub(1, Ordering::Relaxed);
         info!(
             "Player '{}' disconnected from proxy. Online players: {}",
@@ -1272,6 +1284,7 @@ impl BackendBridge {
         plugin_manager: Arc<PluginManager>,
         player_uuid: uuid::Uuid,
         current_server_name: String,
+        timing: Option<&PlayerTiming>,
     ) -> Result<TunnelExit, BridgeError>
     where
         R1: AsyncRead + Unpin,
@@ -1306,6 +1319,16 @@ impl BackendBridge {
             protocol::clientbound_id::<CCommandSuggestions>(play, client_version);
         let commands_packet_id = protocol::clientbound_id::<CCommands>(play, client_version);
         let play_disconnect_id = protocol::clientbound_id::<CPlayDisconnect>(play, client_version);
+
+        // Packet timing reads packets as the backend gets them: in the current version for a
+        // translated client. A new backend is a new place, like a teleport.
+        let backend_version = legacy::backend_version(client_version);
+        let timing_ids = timing.map(|_| PacketIds::new(backend_version));
+        let teleport_id = protocol::clientbound_id::<CPlayerPosition>(play, backend_version);
+        let timing_now = || session_manager.packet_timing.now_ms();
+        if let Some(timing) = timing {
+            packet_timing::lock(timing).teleported();
+        }
 
         let pending_suggestions: Arc<
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
@@ -1358,6 +1381,9 @@ impl BackendBridge {
                                 username
                             );
                             return TunnelExit::ClientDisconnected;
+                        }
+                        if let Some(timing) = timing {
+                            packet_timing::lock(timing).packet(timing_now());
                         }
 
                         // Clients send `chat_command_signed` instead of `chat_command`
@@ -1585,6 +1611,22 @@ impl BackendBridge {
                             }
                             None => vec![legacy::frame(raw_packet.id, &raw_packet.payload)],
                         };
+                        if let (Some(timing), Some(ids)) = (timing, &timing_ids) {
+                            let now = timing_now();
+                            let mut recorder = packet_timing::lock(timing);
+                            if legacy.is_some() {
+                                for frame in &frames {
+                                    if let Some((id, payload)) = packet_timing::split_frame(frame) {
+                                        recorder.serverbound(ids.classify(id, payload), now);
+                                    }
+                                }
+                            } else {
+                                recorder.serverbound(
+                                    ids.classify(raw_packet.id, &raw_packet.payload),
+                                    now,
+                                );
+                            }
+                        }
                         for frame in frames {
                             if backend_tx.send(frame).is_err() {
                                 return TunnelExit::BackendDisconnected { reason: None };
@@ -1603,6 +1645,11 @@ impl BackendBridge {
             loop {
                 match backend_decoder.get_raw_packet().await {
                     Ok(raw_packet) => {
+                        if let Some(timing) = timing
+                            && Some(raw_packet.id) == teleport_id
+                        {
+                            packet_timing::lock(timing).teleported();
+                        }
                         // Translated for an old client: the backend speaks the current version.
                         let (packets, play) = match legacy {
                             Some(session) => {
@@ -1856,6 +1903,20 @@ mod tests {
         F: FnOnce(Peers) -> Fut,
         Fut: std::future::Future<Output = Peers>,
     {
+        run_timed_tunnel(version, legacy, None, drive).await
+    }
+
+    /// [`run_tunnel`], timing the client's packets into `timing`.
+    async fn run_timed_tunnel<F, Fut>(
+        version: JavaMinecraftVersion,
+        legacy: Option<Arc<legacy::Session>>,
+        timing: Option<&PlayerTiming>,
+        drive: F,
+    ) -> (TunnelExit, Vec<pumpkin_protocol::RawPacket>)
+    where
+        F: FnOnce(Peers) -> Fut,
+        Fut: std::future::Future<Output = Peers>,
+    {
         let (proxy_client, client) = tokio::io::duplex(1 << 16);
         let (proxy_backend, backend) = tokio::io::duplex(1 << 16);
         let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client);
@@ -1897,6 +1958,7 @@ mod tests {
             plugin_manager,
             uuid::Uuid::nil(),
             "lobby".to_string(),
+            timing,
         );
         let (exit, mut peers) = tokio::join!(
             async { timeout(Duration::from_secs(10), tunnel).await },
@@ -1914,6 +1976,48 @@ mod tests {
             to_backend.push(packet);
         }
         (exit, to_backend)
+    }
+
+    #[tokio::test]
+    async fn packet_timing_reads_what_the_backend_gets() {
+        use crate::packet_timing::PacketTimings;
+        use pumpkin_data::packet::CURRENT_MC_VERSION;
+        use pumpkin_protocol::java::server::play::{SClientTickEnd, SSwingArm};
+
+        let version = CURRENT_MC_VERSION;
+        let timings = PacketTimings::default();
+        let timing = timings.start(uuid::Uuid::nil(), version);
+        let swing = protocol::serverbound_id::<SSwingArm>(ConnectionState::Play, version).unwrap();
+        let tick =
+            protocol::serverbound_id::<SClientTickEnd>(ConnectionState::Play, version).unwrap();
+        let (_, to_backend) =
+            run_timed_tunnel(version, None, Some(&timing), |mut peers| async move {
+                for _ in 0..3 {
+                    peers.send_from_client(packet_bytes(swing, &[])).await;
+                    peers.send_from_client(packet_bytes(tick, &[])).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let disconnect =
+                    protocol::clientbound_id::<CPlayDisconnect>(ConnectionState::Play, version)
+                        .unwrap();
+                peers
+                    .send_from_backend(packet_bytes(disconnect, &string_payload("\"bye\"")))
+                    .await;
+                peers
+            })
+            .await;
+        assert_eq!(to_backend.len(), 6);
+        let samples = timings.take();
+        let metric = |name: &str| {
+            samples[0]
+                .metrics
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(metric("packets"), Some(6.0));
+        assert_eq!(metric("swings"), Some(3.0));
+        assert_eq!(metric("ticks"), Some(3.0));
     }
 
     #[tokio::test]
