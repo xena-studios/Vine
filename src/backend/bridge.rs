@@ -1,17 +1,17 @@
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::java::client::config::CConfigDisconnect;
+use pumpkin_protocol::java::client::config::{CConfigDisconnect, CFinishConfig};
 use pumpkin_protocol::java::client::login::{
     CLoginDisconnect, CLoginPluginRequest, CLoginSuccess, CSetCompression,
 };
 use pumpkin_protocol::java::client::play::{
-    ArgumentType, CCommandSuggestions, CCommands, CPlayDisconnect, CStartConfiguration,
-    CSystemChatMessage, CTransfer, ProtoNode, ProtoNodeType, StringProtoArgBehavior,
-    SuggestionProviders,
+    ArgumentType, CActionBar, CCommandSuggestions, CCommands, CPlayDisconnect, CStartConfiguration,
+    CSubtitle, CSystemChatMessage, CTitleAnimation, CTitleText, CTransfer, ProtoNode,
+    ProtoNodeType, StringProtoArgBehavior, SuggestionProviders,
 };
 use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
 use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
@@ -45,7 +45,7 @@ use crate::network;
 use crate::plugin::PluginManager;
 use crate::plugin::api::{
     PlayerChatEvent, PlayerCommandEvent, PlayerDisconnectEvent, PlayerJoinEvent,
-    PluginMessageEvent, ServerConnectEvent, ServerConnectedEvent,
+    PluginMessageEvent, ServerConnectEvent, ServerConnectedEvent, ServerKickEvent,
 };
 use crate::protocol::{self, VersionedPacket};
 use crate::security::PacketRateLimiter;
@@ -69,7 +69,12 @@ pub enum BridgeError {
     VelocityError(String),
     #[error("Vine forwarding error: {0}")]
     VineError(String),
+    #[error("Client went away: {0}")]
+    ClientGone(String),
 }
+
+type BackendRead = TCPNetworkDecoder<tokio::net::tcp::OwnedReadHalf>;
+type BackendWrite = TCPNetworkEncoder<tokio::net::tcp::OwnedWriteHalf>;
 
 #[derive(Debug)]
 pub enum TunnelExit {
@@ -81,12 +86,13 @@ pub enum TunnelExit {
     Transfer { host: String, port: u16 },
     /// Backend server closed connection or sent disconnect/kick
     BackendDisconnected { reason: Option<String> },
+    /// A plugin disconnected the player (`disconnect-player`): a real disconnect, no fallback
+    Disconnect { reason: String },
 }
 
 pub struct BackendBridge {
     server_name: String,
     config: BackendConfig,
-    fallback_server: Option<(String, BackendConfig)>,
     client_ip: IpAddr,
     client_version: JavaMinecraftVersion,
     /// The version backends see: the current one when Vine translates for the client.
@@ -108,7 +114,6 @@ impl BackendBridge {
     pub fn new(
         server_name: String,
         config: BackendConfig,
-        fallback_server: Option<(String, BackendConfig)>,
         client_ip: IpAddr,
         client_version: JavaMinecraftVersion,
         virtual_host: String,
@@ -125,7 +130,6 @@ impl BackendBridge {
         Self {
             server_name,
             config,
-            fallback_server,
             client_ip,
             client_version,
             backend_version: legacy::backend_version(client_version),
@@ -446,6 +450,7 @@ impl BackendBridge {
         client_decoder: &mut TCPNetworkDecoder<R>,
         client_encoder: &mut TCPNetworkEncoder<W>,
         backend_encoder: &mut TCPNetworkEncoder<B>,
+        in_config: &AtomicBool,
     ) -> Result<(), BridgeError>
     where
         R: AsyncRead + Unpin,
@@ -466,6 +471,7 @@ impl BackendBridge {
             client_decoder,
             client_encoder,
             backend_encoder,
+            in_config,
         )
         .await?;
         if let Some(session) = legacy {
@@ -474,10 +480,136 @@ impl BackendBridge {
         Ok(())
     }
 
+    /// Fires `server-kick` for a player who lost `lost` and returns the plugins' answer.
+    async fn kick_event(
+        &self,
+        lost: &str,
+        reason: Option<String>,
+        initial: bool,
+    ) -> ServerKickEvent {
+        let mut event = ServerKickEvent {
+            uuid: self.player.id.to_string(),
+            username: self.player.username.clone(),
+            server_name: lost.to_string(),
+            reason,
+            initial,
+            fallback_server: None,
+            message: None,
+        };
+        self.plugin_manager.fire_server_kick(&mut event).await;
+        event
+    }
+
+    /// Where a player who lost `lost` may go, in order: see [`fallback_order`].
+    fn candidates(&self, event: &ServerKickEvent, lost: &str) -> Vec<String> {
+        let servers = &self.proxy_config.servers;
+        let configured = if self.proxy_config.routing.try_fallback_on_connect_failure {
+            self.proxy_config.routing.fallback_server.as_deref()
+        } else {
+            None
+        };
+        fallback_order(
+            event.fallback_server.as_deref(),
+            configured,
+            servers.limbo().as_deref(),
+            lost,
+            |name| servers.contains_key(name),
+        )
+    }
+
+    /// Moves a player who lost their backend (`lost`) to the first candidate that takes them.
+    /// The client is in play, or already in configuration if `in_config` is set. Returns the
+    /// new backend, its name and what to tell the player, or `None` if nothing took them or
+    /// the client went away.
+    #[allow(clippy::type_complexity)]
+    async fn fall_back<R, W>(
+        &self,
+        lost: &str,
+        reason: Option<String>,
+        legacy: Option<&legacy::Session>,
+        client_decoder: &mut TCPNetworkDecoder<R>,
+        client_encoder: &mut TCPNetworkEncoder<W>,
+        in_config: &AtomicBool,
+    ) -> Option<(BackendRead, BackendWrite, String, String)>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let event = self.kick_event(lost, reason.clone(), false).await;
+        for candidate in self.candidates(&event, lost) {
+            let Some(cfg) = self.proxy_config.servers.get(&candidate) else {
+                continue;
+            };
+            info!(
+                "Moving player '{}' to '{}' after losing '{}' ({})",
+                self.player.username,
+                candidate,
+                lost,
+                reason.as_deref().unwrap_or("connection closed")
+            );
+            let (dec, mut enc, _) = match self.login_backend(&candidate, &cfg).await {
+                Ok(backend) => backend,
+                Err(e) => {
+                    warn!(
+                        "Fallback '{}' for player '{}' failed: {}",
+                        candidate, self.player.username, e
+                    );
+                    continue;
+                }
+            };
+            let entered = if in_config.load(Ordering::Acquire) {
+                acknowledge_login(self.backend_version, &mut enc)
+                    .await
+                    .map(|()| {
+                        if let Some(session) = legacy {
+                            session.reset(ConnectionState::Config);
+                        }
+                    })
+            } else {
+                self.reenter_configuration(
+                    legacy,
+                    &candidate,
+                    client_decoder,
+                    client_encoder,
+                    &mut enc,
+                    in_config,
+                )
+                .await
+            };
+            match entered {
+                Ok(()) => {
+                    let notice = event
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| moved_notice(lost, reason.as_deref(), &candidate));
+                    return Some((dec, enc, candidate, notice));
+                }
+                Err(BridgeError::ClientGone(e)) => {
+                    debug!(
+                        "Player '{}' left while moving to '{}': {}",
+                        self.player.username, candidate, e
+                    );
+                    return None;
+                }
+                Err(e) => warn!(
+                    "Player '{}' did not finish moving to '{}': {}",
+                    self.player.username, candidate, e
+                ),
+            }
+        }
+        None
+    }
+
     /// Establishes connection to backend, handles login handshake, and tunnels packets
     ///
     /// Returns `Err` only if the player never reached a backend. Once they have, every
     /// exit goes through the end of this function, which fires `player-disconnect`.
+    ///
+    /// Vine never disconnects a player because of a backend: a kick, a crash, a closed
+    /// connection or a backend it can't reach moves them to the server plugins pick in
+    /// `server-kick`, then `routing.fallback_server`, then the built-in limbo. Only the
+    /// client leaving, a plugin's `disconnect-player`, or nothing at all taking them ends
+    /// the connection.
     pub async fn run<R, W>(
         self,
         mut client_decoder: TCPNetworkDecoder<R>,
@@ -492,13 +624,11 @@ impl BackendBridge {
             self.player.username, self.player.id, self.server_name, self.config.address
         );
 
-        let mut current_server_name = self.server_name.clone();
-
         let mut connect_event = ServerConnectEvent {
             uuid: self.player.id.to_string(),
             username: self.player.username.clone(),
             current_server: None,
-            target_server: current_server_name.clone(),
+            target_server: self.server_name.clone(),
             cancelled: false,
             cancel_reason: None,
         };
@@ -515,38 +645,60 @@ impl BackendBridge {
             );
             return Err(BridgeError::VineError(reason));
         }
-        current_server_name = connect_event.target_server;
+        let target = connect_event.target_server;
+        let mut pending_notice: Option<String> = None;
 
-        let initial_backend_cfg = if current_server_name == self.server_name {
-            self.config.clone()
-        } else if let Some(cfg) = self.proxy_config.servers.get(&current_server_name) {
-            cfg.clone()
-        } else {
-            self.config.clone()
+        // The first backend. The client is still in the login state, so any candidate can
+        // take it from here.
+        let first = match self.proxy_config.servers.get(&target) {
+            Some(cfg) => self
+                .login_backend(&target, &cfg)
+                .await
+                .map_err(|e| e.to_string()),
+            None if target == self.server_name => self
+                .login_backend(&target, &self.config)
+                .await
+                .map_err(|e| e.to_string()),
+            None => Err(format!("server '{target}' isn't registered")),
         };
-
-        let (mut backend_decoder, mut backend_encoder, success_bytes) = match self
-            .login_backend(&current_server_name, &initial_backend_cfg)
-            .await
-        {
-            Ok(res) => res,
-            Err(e) => {
-                if let Some((fb_name, fb_cfg)) = &self.fallback_server {
-                    if fb_name != &current_server_name {
-                        warn!(
-                            "Primary server '{}' unreachable ({}), attempting failover to fallback server '{}' at {}",
-                            current_server_name, e, fb_name, fb_cfg.address
-                        );
-                        current_server_name = fb_name.clone();
-                        self.login_backend(&current_server_name, fb_cfg).await?
-                    } else {
-                        return Err(e);
+        let (mut current_server_name, (mut backend_decoder, mut backend_encoder, success_bytes)) =
+            match first {
+                Ok(backend) => (target.clone(), backend),
+                Err(err) => {
+                    warn!(
+                        "Player '{}' couldn't reach '{}': {}",
+                        self.player.username, target, err
+                    );
+                    let event = self.kick_event(&target, Some(err.clone()), true).await;
+                    let mut found = None;
+                    for candidate in self.candidates(&event, &target) {
+                        let Some(cfg) = self.proxy_config.servers.get(&candidate) else {
+                            continue;
+                        };
+                        match self.login_backend(&candidate, &cfg).await {
+                            Ok(backend) => {
+                                found = Some((candidate, backend));
+                                break;
+                            }
+                            Err(e) => warn!(
+                                "Fallback '{}' for player '{}' failed: {}",
+                                candidate, self.player.username, e
+                            ),
+                        }
                     }
-                } else {
-                    return Err(e);
+                    let Some((name, backend)) = found else {
+                        return Err(BridgeError::VineError(format!(
+                            "No server could take the player: {err}"
+                        )));
+                    };
+                    let notice = event
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| unreachable_notice(&target, &name));
+                    pending_notice = Some(notice);
+                    (name, backend)
                 }
-            }
-        };
+            };
 
         // Forward login success packet to the client
         let legacy = legacy::Session::new(self.client_version, self.player.id);
@@ -567,6 +719,8 @@ impl BackendBridge {
             .flush()
             .await
             .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+        // 1.20.2+ clients go on to configuration after Login Success.
+        let in_config = AtomicBool::new(self.client_version >= JavaMinecraftVersion::V_1_20_2);
 
         self.online_players.fetch_add(1, Ordering::Relaxed);
         info!(
@@ -602,6 +756,11 @@ impl BackendBridge {
             client_ip: self.client_ip.to_string(),
             protocol_version: self.client_version.protocol_version() as u32,
         });
+        if let Some(notice) = pending_notice.take() {
+            let _ = action_tx.send(PlayerAction::Message(TextComponent::from_legacy_string(
+                &notice,
+            )));
+        }
 
         loop {
             let tunnel_res = Self::bridge_tunnel(
@@ -621,6 +780,7 @@ impl BackendBridge {
                 self.plugin_manager.clone(),
                 self.player.id,
                 current_server_name.clone(),
+                &in_config,
             )
             .await;
 
@@ -637,7 +797,9 @@ impl BackendBridge {
                 }
             };
 
-            match exit {
+            // Where the player is moved after losing their backend (or a switch that
+            // failed half way): `(lost, reason)`.
+            let lost = match exit {
                 TunnelExit::ClientDisconnected => {
                     debug!(
                         "Player '{}' disconnected from client side",
@@ -645,11 +807,28 @@ impl BackendBridge {
                     );
                     break;
                 }
+                TunnelExit::Disconnect { reason } => {
+                    info!(
+                        "Disconnecting player '{}': {}",
+                        self.player.username, reason
+                    );
+                    Self::disconnect_client(
+                        &mut client_encoder,
+                        self.client_version,
+                        in_config.load(Ordering::Acquire),
+                        &reason,
+                    )
+                    .await;
+                    break;
+                }
                 TunnelExit::Transfer { host, port } => {
                     let transfer = CTransfer::new(&host, VarInt(port as i32));
-                    if let Ok(bytes) =
-                        transfer.serialize_for_client(ConnectionState::Play, self.client_version)
-                    {
+                    let state = if in_config.load(Ordering::Acquire) {
+                        ConnectionState::Config
+                    } else {
+                        ConnectionState::Play
+                    };
+                    if let Ok(bytes) = transfer.serialize_for_client(state, self.client_version) {
                         let _ = client_encoder.write_packet(bytes).await;
                         let _ = client_encoder.flush().await;
                     }
@@ -681,140 +860,80 @@ impl BackendBridge {
                             .cancel_reason
                             .as_deref()
                             .unwrap_or("Server switch cancelled by plugin");
-                        let msg = TextComponent::text(format!("§c{}", reason));
-                        let chat_msg = CSystemChatMessage::new(&msg, false);
-                        if let Ok(bytes) = chat_msg
-                            .serialize_for_client(ConnectionState::Play, self.client_version)
-                        {
-                            let _ = client_encoder.write_packet(bytes).await;
-                            let _ = client_encoder.flush().await;
-                        }
+                        let _ = action_tx.send(PlayerAction::Message(
+                            TextComponent::from_legacy_string(&format!("§c{reason}")),
+                        ));
                         continue;
                     }
                     let server_name = connect_event.target_server;
 
-                    let target_config = match self.proxy_config.servers.get(&server_name) {
-                        Some(cfg) => cfg.clone(),
-                        None => {
-                            let msg = TextComponent::text(format!(
-                                "Server '{}' does not exist.",
-                                server_name
-                            ));
-                            let chat_msg = CSystemChatMessage::new(&msg, false);
-                            if let Ok(bytes) = chat_msg
-                                .serialize_for_client(ConnectionState::Play, self.client_version)
-                            {
-                                let _ = client_encoder.write_packet(bytes).await;
-                                let _ = client_encoder.flush().await;
-                            }
-                            break;
-                        }
+                    let Some(target_config) = self.proxy_config.servers.get(&server_name) else {
+                        let _ = action_tx.send(PlayerAction::Message(TextComponent::text(
+                            format!("Server '{}' does not exist.", server_name),
+                        )));
+                        continue;
                     };
 
                     match self.login_backend(&server_name, &target_config).await {
                         Ok((new_dec, mut new_enc, _)) => {
-                            if let Err(e) = self
+                            match self
                                 .reenter_configuration(
                                     legacy.as_deref(),
                                     &server_name,
                                     &mut client_decoder,
                                     &mut client_encoder,
                                     &mut new_enc,
+                                    &in_config,
                                 )
                                 .await
                             {
-                                warn!(
-                                    "Player '{}' did not finish switching to '{}': {}",
-                                    self.player.username, server_name, e
-                                );
-                                break;
+                                Ok(()) => {
+                                    backend_decoder = new_dec;
+                                    backend_encoder = new_enc;
+                                    current_server_name = server_name.clone();
+                                    self.session_manager
+                                        .update_server(&self.player.username, &current_server_name);
+                                    info!(
+                                        "Player '{}' successfully switched to '{}'",
+                                        self.player.username, current_server_name
+                                    );
+                                    let connected_event = ServerConnectedEvent {
+                                        uuid: self.player.id.to_string(),
+                                        username: self.player.username.clone(),
+                                        server_name: current_server_name.clone(),
+                                    };
+                                    self.plugin_manager
+                                        .fire_server_connected(&connected_event)
+                                        .await;
+                                    continue;
+                                }
+                                Err(BridgeError::ClientGone(e)) => {
+                                    debug!(
+                                        "Player '{}' left while switching to '{}': {}",
+                                        self.player.username, server_name, e
+                                    );
+                                    break;
+                                }
+                                // The client already left its old server: move it on.
+                                Err(e) => {
+                                    warn!(
+                                        "Player '{}' did not finish switching to '{}': {}",
+                                        self.player.username, server_name, e
+                                    );
+                                    (server_name, Some(e.to_string()))
+                                }
                             }
-                            backend_decoder = new_dec;
-                            backend_encoder = new_enc;
-                            current_server_name = server_name.clone();
-                            self.session_manager
-                                .update_server(&self.player.username, &current_server_name);
-                            info!(
-                                "Player '{}' successfully switched to '{}'",
-                                self.player.username, current_server_name
-                            );
-                            let connected_event = ServerConnectedEvent {
-                                uuid: self.player.id.to_string(),
-                                username: self.player.username.clone(),
-                                server_name: current_server_name.clone(),
-                            };
-                            self.plugin_manager
-                                .fire_server_connected(&connected_event)
-                                .await;
                         }
                         Err(e) => {
+                            // The client is still on its old server: it stays there.
                             warn!(
                                 "Failed to switch player '{}' to '{}': {}",
                                 self.player.username, server_name, e
                             );
-                            let msg = TextComponent::text(format!(
-                                "§cFailed to connect to server '{}': {}",
-                                server_name, e
-                            ));
-                            let chat_msg = CSystemChatMessage::new(&msg, false);
-                            if let Ok(bytes) = chat_msg
-                                .serialize_for_client(ConnectionState::Play, self.client_version)
-                            {
-                                let _ = client_encoder.write_packet(bytes).await;
-                                let _ = client_encoder.flush().await;
-                            }
-
-                            let can_fallback = self
-                                .fallback_server
-                                .as_ref()
-                                .is_some_and(|(fb_name, _)| fb_name != &server_name);
-
-                            if can_fallback {
-                                let (fb_name, fb_cfg) = self.fallback_server.as_ref().unwrap();
-                                match self.login_backend(fb_name, fb_cfg).await {
-                                    Ok((new_dec, mut new_enc, _)) => {
-                                        if let Err(e) = self
-                                            .reenter_configuration(
-                                                legacy.as_deref(),
-                                                fb_name,
-                                                &mut client_decoder,
-                                                &mut client_encoder,
-                                                &mut new_enc,
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                "Player '{}' did not finish switching to '{}': {}",
-                                                self.player.username, fb_name, e
-                                            );
-                                            break;
-                                        }
-                                        backend_decoder = new_dec;
-                                        backend_encoder = new_enc;
-                                        current_server_name = fb_name.clone();
-                                        self.session_manager.update_server(
-                                            &self.player.username,
-                                            &current_server_name,
-                                        );
-                                    }
-                                    Err(_) => {
-                                        let kick_reason = format!(
-                                            "Lost connection to '{}' and fallback unavailable",
-                                            current_server_name
-                                        );
-                                        Self::disconnect_client(
-                                            &mut client_encoder,
-                                            self.client_version,
-                                            false,
-                                            &kick_reason,
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                }
-                            } else {
-                                break;
-                            }
+                            let _ = action_tx.send(PlayerAction::Message(TextComponent::text(
+                                format!("§cFailed to connect to server '{}': {}", server_name, e),
+                            )));
+                            continue;
                         }
                     }
                 }
@@ -823,90 +942,58 @@ impl BackendBridge {
                         "Backend server '{}' disconnected player '{}': {:?}",
                         current_server_name, self.player.username, reason
                     );
+                    (current_server_name.clone(), reason)
+                }
+            };
 
-                    let can_fallback = self
-                        .fallback_server
-                        .as_ref()
-                        .is_some_and(|(fb_name, _)| fb_name != &current_server_name);
-
-                    if can_fallback {
-                        let (fb_name, fb_cfg) = self.fallback_server.as_ref().unwrap();
-                        let reason_str = reason.as_deref().unwrap_or("Server closed");
-                        info!(
-                            "Rerouting player '{}' to fallback server '{}' (kicked from '{}': {})",
-                            self.player.username, fb_name, current_server_name, reason_str
-                        );
-
-                        let notice = TextComponent::text(format!(
-                            "§eConnecting to fallback server '{}'... (§c{}§e)",
-                            fb_name, reason_str
-                        ));
-                        let chat_msg = CSystemChatMessage::new(&notice, false);
-                        if let Ok(bytes) = chat_msg
-                            .serialize_for_client(ConnectionState::Play, self.client_version)
-                        {
-                            let _ = client_encoder.write_packet(bytes).await;
-                            let _ = client_encoder.flush().await;
-                        }
-
-                        match self.login_backend(fb_name, fb_cfg).await {
-                            Ok((new_dec, mut new_enc, _)) => {
-                                if let Err(e) = self
-                                    .reenter_configuration(
-                                        legacy.as_deref(),
-                                        fb_name,
-                                        &mut client_decoder,
-                                        &mut client_encoder,
-                                        &mut new_enc,
-                                    )
-                                    .await
-                                {
-                                    warn!(
-                                        "Player '{}' did not finish switching to '{}': {}",
-                                        self.player.username, fb_name, e
-                                    );
-                                    break;
-                                }
-                                backend_decoder = new_dec;
-                                backend_encoder = new_enc;
-                                current_server_name = fb_name.clone();
-                                self.session_manager
-                                    .update_server(&self.player.username, &current_server_name);
-                                info!(
-                                    "Player '{}' successfully recovered to fallback '{}'",
-                                    self.player.username, current_server_name
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to connect player '{}' to fallback server '{}': {}",
-                                    self.player.username, fb_name, e
-                                );
-                                let kick_reason = format!(
-                                    "Lost connection to '{}' and fallback unavailable: {}",
-                                    current_server_name, e
-                                );
-                                Self::disconnect_client(
-                                    &mut client_encoder,
-                                    self.client_version,
-                                    false,
-                                    &kick_reason,
-                                )
-                                .await;
-                                break;
-                            }
-                        }
-                    } else {
-                        let reason_str = reason.as_deref().unwrap_or("Lost connection to server");
-                        Self::disconnect_client(
-                            &mut client_encoder,
-                            self.client_version,
-                            false,
-                            reason_str,
-                        )
+            let (lost, reason) = lost;
+            match self
+                .fall_back(
+                    &lost,
+                    reason.clone(),
+                    legacy.as_deref(),
+                    &mut client_decoder,
+                    &mut client_encoder,
+                    &in_config,
+                )
+                .await
+            {
+                Some((new_dec, new_enc, name, notice)) => {
+                    backend_decoder = new_dec;
+                    backend_encoder = new_enc;
+                    current_server_name = name;
+                    self.session_manager
+                        .update_server(&self.player.username, &current_server_name);
+                    info!(
+                        "Player '{}' moved to '{}' after losing '{}'",
+                        self.player.username, current_server_name, lost
+                    );
+                    let connected_event = ServerConnectedEvent {
+                        uuid: self.player.id.to_string(),
+                        username: self.player.username.clone(),
+                        server_name: current_server_name.clone(),
+                    };
+                    self.plugin_manager
+                        .fire_server_connected(&connected_event)
                         .await;
-                        break;
-                    }
+                    let _ = action_tx.send(PlayerAction::Message(
+                        TextComponent::from_legacy_string(&notice),
+                    ));
+                }
+                None => {
+                    let reason = format!(
+                        "Lost connection to '{}' and no other server could take you: {}",
+                        lost,
+                        reason.as_deref().unwrap_or("connection closed")
+                    );
+                    Self::disconnect_client(
+                        &mut client_encoder,
+                        self.client_version,
+                        in_config.load(Ordering::Acquire),
+                        &reason,
+                    )
+                    .await;
+                    break;
                 }
             }
         }
@@ -1007,6 +1094,7 @@ async fn reenter_configuration<R, W, B>(
     client_decoder: &mut TCPNetworkDecoder<R>,
     client_encoder: &mut TCPNetworkEncoder<W>,
     backend_encoder: &mut TCPNetworkEncoder<B>,
+    in_config: &AtomicBool,
 ) -> Result<(), BridgeError>
 where
     R: AsyncRead + Unpin,
@@ -1023,11 +1111,11 @@ where
     client_encoder
         .write_packet(start)
         .await
-        .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+        .map_err(|e| BridgeError::ClientGone(e.to_string()))?;
     client_encoder
         .flush()
         .await
-        .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+        .map_err(|e| BridgeError::ClientGone(e.to_string()))?;
 
     let acknowledged_id = protocol::serverbound_id::<SConfigurationAcknowledged>(
         ConnectionState::Play,
@@ -1036,9 +1124,10 @@ where
     loop {
         let packet = timeout(wait, client_decoder.get_raw_packet())
             .await
-            .map_err(|_| BridgeError::LoginTimeout(server_name.to_string()))?
-            .map_err(|e| BridgeError::DecodeError(e.to_string()))?;
+            .map_err(|_| BridgeError::ClientGone("no Configuration Acknowledged".to_string()))?
+            .map_err(|e| BridgeError::ClientGone(e.to_string()))?;
         if Some(packet.id) == acknowledged_id {
+            in_config.store(true, Ordering::Release);
             break;
         }
         debug!(
@@ -1047,6 +1136,14 @@ where
         );
     }
 
+    acknowledge_login(backend_version, backend_encoder).await
+}
+
+/// Sends Login Acknowledged to a backend that is waiting for it after Login Success.
+async fn acknowledge_login<B: AsyncWrite + Unpin>(
+    backend_version: JavaMinecraftVersion,
+    backend_encoder: &mut TCPNetworkEncoder<B>,
+) -> Result<(), BridgeError> {
     let acknowledged = SLoginAcknowledged
         .serialize_for_server(ConnectionState::Login, backend_version)
         .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
@@ -1058,6 +1155,42 @@ where
         .flush()
         .await
         .map_err(|e| BridgeError::EncodeError(e.to_string()))
+}
+
+/// The servers a player who lost `lost` is tried on, in order: the one a plugin picked in
+/// `server-kick`, the configured fallback, then the limbo. Each once, only registered ones,
+/// never `lost` itself (except the limbo, which is tried again if it was the one lost).
+pub fn fallback_order(
+    plugin: Option<&str>,
+    configured: Option<&str>,
+    limbo: Option<&str>,
+    lost: &str,
+    registered: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for (name, may_be_lost) in [(plugin, false), (configured, false), (limbo, true)] {
+        let Some(name) = name.filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        if (name == lost && !may_be_lost) || !registered(name) || order.iter().any(|n| n == name) {
+            continue;
+        }
+        order.push(name.to_string());
+    }
+    order
+}
+
+/// What a player who was moved off `lost` is told by default.
+fn moved_notice(lost: &str, reason: Option<&str>, to: &str) -> String {
+    match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(reason) => format!("§cYou were moved from {lost} to {to}: §f{reason}"),
+        None => format!("§cYou lost the connection to {lost}, so you were moved to {to}."),
+    }
+}
+
+/// What a player whose first server couldn't be reached is told by default.
+fn unreachable_notice(target: &str, to: &str) -> String {
+    format!("§e{target} couldn't take you right now, so you're on {to}.")
 }
 
 /// Completions for a pre-1.13 tab-complete request: proxy command names (with their slash) and
@@ -1272,6 +1405,7 @@ impl BackendBridge {
         plugin_manager: Arc<PluginManager>,
         player_uuid: uuid::Uuid,
         current_server_name: String,
+        in_config: &AtomicBool,
     ) -> Result<TunnelExit, BridgeError>
     where
         R1: AsyncRead + Unpin,
@@ -1306,6 +1440,10 @@ impl BackendBridge {
             protocol::clientbound_id::<CCommandSuggestions>(play, client_version);
         let commands_packet_id = protocol::clientbound_id::<CCommands>(play, client_version);
         let play_disconnect_id = protocol::clientbound_id::<CPlayDisconnect>(play, client_version);
+        let config = ConnectionState::Config;
+        let finish_config_id = protocol::clientbound_id::<CFinishConfig>(config, client_version);
+        let config_disconnect_id =
+            protocol::clientbound_id::<CConfigDisconnect>(config, client_version);
 
         let pending_suggestions: Arc<
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
@@ -1623,8 +1761,20 @@ impl BackendBridge {
                             None => (vec![(raw_packet.id, raw_packet.payload)], true),
                         };
                         for (packet_id, packet_payload) in packets {
-                            // Configuration packets reuse play ids; only play is inspected.
-                            if !play {
+                            // Configuration packets reuse play ids; only play is inspected,
+                            // apart from the end of configuration and a disconnect in it.
+                            if !play || in_config.load(Ordering::Acquire) {
+                                if Some(packet_id) == config_disconnect_id {
+                                    let mut cur = &packet_payload[..];
+                                    let reason = cur
+                                        .get_component(&client_version)
+                                        .map(|c| c.to_pretty_console())
+                                        .ok();
+                                    return TunnelExit::BackendDisconnected { reason };
+                                }
+                                if Some(packet_id) == finish_config_id {
+                                    in_config.store(false, Ordering::Release);
+                                }
                                 if client_tx
                                     .send(legacy::frame(packet_id, &packet_payload))
                                     .is_err()
@@ -1754,16 +1904,49 @@ impl BackendBridge {
                         }
                     }
                     PlayerAction::Disconnect(reason) => {
-                        let text = TextComponent::text(reason.clone());
-                        let disconnect_pkt = CPlayDisconnect::new(&text);
-                        if let Ok(bytes) = disconnect_pkt
+                        return TunnelExit::Disconnect { reason };
+                    }
+                    PlayerAction::ActionBar(text) => {
+                        // Before 1.17 the action bar is a chat message in its own slot.
+                        let bytes = CActionBar::new(&text)
                             .serialize_for_client(ConnectionState::Play, client_version)
-                        {
+                            .or_else(|_| {
+                                CSystemChatMessage::new(&text, true)
+                                    .serialize_for_client(ConnectionState::Play, client_version)
+                            });
+                        if let Ok(bytes) = bytes {
                             let _ = client_tx.send(bytes);
                         }
-                        return TunnelExit::BackendDisconnected {
-                            reason: Some(reason),
-                        };
+                    }
+                    PlayerAction::Title {
+                        title,
+                        subtitle,
+                        fade_in,
+                        stay,
+                        fade_out,
+                    } => {
+                        let packets = [
+                            CTitleAnimation::new(fade_in, stay, fade_out)
+                                .serialize_for_client(ConnectionState::Play, client_version),
+                            CSubtitle::new(&subtitle)
+                                .serialize_for_client(ConnectionState::Play, client_version),
+                            CTitleText::new(&title)
+                                .serialize_for_client(ConnectionState::Play, client_version),
+                        ];
+                        if packets.iter().all(Result::is_ok) {
+                            for bytes in packets.into_iter().flatten() {
+                                let _ = client_tx.send(bytes);
+                            }
+                        } else {
+                            // No title packets for this client: say it in chat.
+                            for text in [title, subtitle] {
+                                if let Ok(bytes) = CSystemChatMessage::new(&text, false)
+                                    .serialize_for_client(ConnectionState::Play, client_version)
+                                {
+                                    let _ = client_tx.send(bytes);
+                                }
+                            }
+                        }
                     }
                     PlayerAction::PluginMessage { channel, data } => {
                         let data = plugin_message_body(data, client_version);
@@ -1856,6 +2039,22 @@ mod tests {
         F: FnOnce(Peers) -> Fut,
         Fut: std::future::Future<Output = Peers>,
     {
+        run_tunnel_with(version, legacy, Vec::new(), false, drive).await
+    }
+
+    /// [`run_tunnel`] with actions queued for the player first, and the client starting in
+    /// configuration if `in_config`.
+    async fn run_tunnel_with<F, Fut>(
+        version: JavaMinecraftVersion,
+        legacy: Option<Arc<legacy::Session>>,
+        actions: Vec<PlayerAction>,
+        in_config: bool,
+        drive: F,
+    ) -> (TunnelExit, Vec<pumpkin_protocol::RawPacket>)
+    where
+        F: FnOnce(Peers) -> Fut,
+        Fut: std::future::Future<Output = Peers>,
+    {
         let (proxy_client, client) = tokio::io::duplex(1 << 16);
         let (proxy_backend, backend) = tokio::io::duplex(1 << 16);
         let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client);
@@ -1877,9 +2076,13 @@ mod tests {
         let plugins_dir = tempfile::tempdir().unwrap();
         let plugin_manager = PluginManager::new(plugins_dir.path().to_path_buf()).unwrap();
         let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
+        for action in actions {
+            action_tx.send(action).unwrap();
+        }
         #[cfg(not(feature = "legacy-clients"))]
         let _ = &legacy;
 
+        let in_config = AtomicBool::new(in_config);
         let tunnel = BackendBridge::bridge_tunnel(
             "tester",
             &mut client_decoder,
@@ -1897,6 +2100,7 @@ mod tests {
             plugin_manager,
             uuid::Uuid::nil(),
             "lobby".to_string(),
+            &in_config,
         );
         let (exit, mut peers) = tokio::join!(
             async { timeout(Duration::from_secs(10), tunnel).await },
@@ -2092,6 +2296,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_disconnect_ends_the_connection_instead_of_falling_back() {
+        let version = JavaMinecraftVersion::V_26_3;
+        let (exit, _) = run_tunnel_with(
+            version,
+            None,
+            vec![PlayerAction::Disconnect("bye".into())],
+            false,
+            |peers| async move { peers },
+        )
+        .await;
+        match exit {
+            TunnelExit::Disconnect { reason } => assert_eq!(reason, "bye"),
+            other => panic!("unexpected exit: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_disconnect_in_configuration_moves_the_player() {
+        // A backend that drops the player while they configure (after a switch) is a lost
+        // backend like any other, not a packet to pass on.
+        let version = JavaMinecraftVersion::V_26_3;
+        let id = protocol::clientbound_id::<CConfigDisconnect>(ConnectionState::Config, version)
+            .unwrap();
+        let mut payload = Vec::new();
+        CConfigDisconnect::new(r#"{"text":"closing"}"#)
+            .write_packet_data(&mut payload, &version)
+            .unwrap();
+        let (exit, _) = run_tunnel_with(version, None, Vec::new(), true, |mut peers| async move {
+            peers.send_from_backend(packet_bytes(id, &payload)).await;
+            peers
+        })
+        .await;
+        assert!(
+            matches!(exit, TunnelExit::BackendDisconnected { .. }),
+            "unexpected exit: {exit:?}"
+        );
+    }
+
+    #[test]
+    fn fallbacks_go_plugin_then_configured_then_limbo() {
+        let registered = |name: &str| ["hub-1", "lobby", "limbo", "game-1"].contains(&name);
+        assert_eq!(
+            fallback_order(
+                Some("hub-1"),
+                Some("lobby"),
+                Some("limbo"),
+                "game-1",
+                registered
+            ),
+            ["hub-1", "lobby", "limbo"]
+        );
+        // The lost server, unregistered names and repeats are skipped.
+        assert_eq!(
+            fallback_order(
+                Some("game-1"),
+                Some("gone"),
+                Some("limbo"),
+                "game-1",
+                registered
+            ),
+            ["limbo"]
+        );
+        assert_eq!(
+            fallback_order(Some("lobby"), Some("lobby"), None, "game-1", registered),
+            ["lobby"]
+        );
+        // Losing the limbo itself tries it again.
+        assert_eq!(
+            fallback_order(None, None, Some("limbo"), "limbo", registered),
+            ["limbo"]
+        );
+        assert!(fallback_order(None, None, None, "game-1", registered).is_empty());
+    }
+
+    #[test]
+    fn default_notices_name_both_servers() {
+        assert_eq!(
+            moved_notice("game-1", Some("Server closed"), "lobby"),
+            "§cYou were moved from game-1 to lobby: §fServer closed"
+        );
+        assert!(moved_notice("game-1", None, "limbo").contains("moved to limbo"));
+        assert!(unreachable_notice("hub", "limbo").contains("hub couldn't take you"));
+    }
+
+    #[tokio::test]
     async fn switch_acknowledges_login_once_client_reenters_configuration() {
         let version = JavaMinecraftVersion::V_26_3;
         // proxy <-> client and proxy <-> new backend, as in-memory pipes
@@ -2122,6 +2411,7 @@ mod tests {
             .unwrap();
         client.flush().await.unwrap();
 
+        let in_config = AtomicBool::new(false);
         reenter_configuration(
             version,
             version,
@@ -2131,9 +2421,11 @@ mod tests {
             &mut client_decoder,
             &mut client_encoder,
             &mut backend_encoder,
+            &in_config,
         )
         .await
         .unwrap();
+        assert!(in_config.load(Ordering::Acquire));
 
         let mut client_view = TCPNetworkDecoder::new(client_read);
         let to_client = client_view.get_raw_packet().await.unwrap();
@@ -2168,6 +2460,7 @@ mod tests {
             &mut TCPNetworkDecoder::new(proxy_client_read),
             &mut TCPNetworkEncoder::new(proxy_client_write),
             &mut TCPNetworkEncoder::new(proxy_backend_write),
+            &AtomicBool::new(false),
         )
         .await
         .unwrap();

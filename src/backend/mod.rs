@@ -36,6 +36,14 @@ impl Router {
             return Some((fallback_name.clone(), cfg));
         }
 
+        // Nothing configured is up: wait in the built-in limbo rather than on some other
+        // server picked by name.
+        if let Some(limbo) = self.servers.limbo()
+            && let Some(cfg) = self.servers.get(&limbo)
+        {
+            return Some((limbo, cfg));
+        }
+
         self.servers.iter().next()
     }
 }

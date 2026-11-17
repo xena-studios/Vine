@@ -353,7 +353,8 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
             WitForwarding::Vine => ForwardingMode::Vine,
         };
         let needs_secret = matches!(forwarding, ForwardingMode::Velocity | ForwardingMode::Vine);
-        if name.trim().is_empty()
+        if proxy.config.servers.is_limbo(&name)
+            || name.trim().is_empty()
             || address.trim().is_empty()
             || (needs_secret && secret.as_deref().is_none_or(str::is_empty))
         {
@@ -378,6 +379,9 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
         let Some(proxy) = &self.proxy else {
             return Ok(false);
         };
+        if proxy.config.servers.is_limbo(&name) {
+            return Ok(false);
+        }
         let removed = proxy.config.servers.remove(&name).is_some();
         if removed {
             tracing::info!("Plugin unregistered backend server '{}'", name);
@@ -405,6 +409,66 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
             .proxy
             .as_ref()
             .is_some_and(|proxy| proxy.config.runtime.is_draining()))
+    }
+
+    async fn send_action_bar(
+        &mut self,
+        player_uuid: String,
+        message: String,
+    ) -> wasmtime::Result<bool> {
+        Ok(self.act(
+            &player_uuid,
+            PlayerAction::ActionBar(pumpkin_util::text::TextComponent::from_legacy_string(
+                &message,
+            )),
+        ))
+    }
+
+    async fn send_title(
+        &mut self,
+        player_uuid: String,
+        title: String,
+        subtitle: String,
+        fade_in: u32,
+        stay: u32,
+        fade_out: u32,
+    ) -> wasmtime::Result<bool> {
+        let ticks = |t: u32| i32::try_from(t).unwrap_or(i32::MAX);
+        Ok(self.act(
+            &player_uuid,
+            PlayerAction::Title {
+                title: pumpkin_util::text::TextComponent::from_legacy_string(&title),
+                subtitle: pumpkin_util::text::TextComponent::from_legacy_string(&subtitle),
+                fade_in: ticks(fade_in),
+                stay: ticks(stay),
+                fade_out: ticks(fade_out),
+            },
+        ))
+    }
+
+    async fn transfer_player(
+        &mut self,
+        player_uuid: String,
+        host: String,
+        port: u16,
+    ) -> wasmtime::Result<bool> {
+        let Some(session) = self.session(&player_uuid) else {
+            return Ok(false);
+        };
+        if !crate::session::supports_transfer(session.protocol_version) || host.is_empty() {
+            return Ok(false);
+        }
+        Ok(session
+            .action_tx
+            .send(PlayerAction::Transfer { host, port })
+            .is_ok())
+    }
+
+    async fn limbo_server(&mut self) -> wasmtime::Result<Option<String>> {
+        Ok(self
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.config.servers.limbo()))
     }
 
     async fn send_plugin_message(
@@ -455,6 +519,7 @@ impl wit::vine::plugin::context::HostContext for PluginHostState {
             wit::vine::plugin::event::EventType::PlayerChat => EventType::PlayerChat,
             wit::vine::plugin::event::EventType::PlayerCommand => EventType::PlayerCommand,
             wit::vine::plugin::event::EventType::PluginMessage => EventType::PluginMessage,
+            wit::vine::plugin::event::EventType::ServerKick => EventType::ServerKick,
         };
 
         let api_priority = match priority {
@@ -524,6 +589,25 @@ impl wit::vine::plugin::context::HostContext for PluginHostState {
             .resource_table
             .delete::<ContextResource>(Resource::new_own(rep.rep()));
         Ok(())
+    }
+}
+
+impl PluginHostState {
+    /// The session of the player with this UUID, if they're online here.
+    fn session(&self, player_uuid: &str) -> Option<crate::session::PlayerSession> {
+        let proxy = self.proxy.as_ref()?;
+        let target = uuid::Uuid::parse_str(player_uuid).ok()?;
+        proxy
+            .session_manager
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.uuid == target)
+    }
+
+    /// Queues `action` for the player; false if they aren't online here.
+    fn act(&self, player_uuid: &str, action: PlayerAction) -> bool {
+        self.session(player_uuid)
+            .is_some_and(|session| session.action_tx.send(action).is_ok())
     }
 }
 

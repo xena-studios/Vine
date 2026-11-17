@@ -288,7 +288,7 @@ impl ClientHandler {
                 "[{}] Player '{}' pre-login cancelled by plugin: {}",
                 self.peer_addr, username, reason
             );
-            Self::kick(&mut encoder, client_version, reason).await?;
+            Self::kick_as_given(&mut encoder, client_version, reason).await?;
             return Ok(());
         }
 
@@ -443,7 +443,7 @@ impl ClientHandler {
                 "[{}] Player '{}' login cancelled by plugin: {}",
                 self.peer_addr, authenticated_player.username, reason
             );
-            Self::kick(&mut encoder, client_version, reason).await?;
+            Self::kick_as_given(&mut encoder, client_version, reason).await?;
             return Ok(());
         }
 
@@ -527,25 +527,9 @@ impl ClientHandler {
             }
         };
 
-        let fallback_server = if self.config.routing.try_fallback_on_connect_failure {
-            self.config
-                .routing
-                .fallback_server
-                .as_ref()
-                .and_then(|fb_name| {
-                    self.config
-                        .servers
-                        .get(fb_name)
-                        .map(|cfg| (fb_name.clone(), cfg.clone()))
-                })
-        } else {
-            None
-        };
-
         let bridge = BackendBridge::new(
             server_name,
             backend_cfg,
-            fallback_server,
             client_ip,
             client_version,
             virtual_host,
@@ -562,6 +546,23 @@ impl ClientHandler {
 
         bridge.run(decoder, encoder).await?;
         Ok(true)
+    }
+
+    /// Disconnects a client at login with a plugin's reason exactly as given: legacy `§` codes
+    /// and line breaks kept, no `[Vine Proxy]` prefix. A network words its own screens.
+    async fn kick_as_given(
+        encoder: &mut TCPNetworkEncoder<OwnedWriteHalf>,
+        version: JavaMinecraftVersion,
+        reason: &str,
+    ) -> Result<(), ClientError> {
+        let json_reason = serde_json::json!({ "text": reason }).to_string();
+        let disconnect = CLoginDisconnect::new(json_reason);
+        let bytes = disconnect
+            .serialize_for_client(ConnectionState::Login, version)
+            .map_err(|e| ClientError::EncodeError(e.to_string()))?;
+        let _ = encoder.write_packet(bytes).await;
+        let _ = encoder.flush().await;
+        Ok(())
     }
 
     /// Helper to send formatted CLoginDisconnect packet to client

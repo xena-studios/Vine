@@ -5,6 +5,9 @@
 //! remove servers without restarting the proxy. Every clone shares the same
 //! servers, so the router, status pings, commands and plugins all see a change
 //! at once. Serializes as the same map `[servers]` always was.
+//!
+//! The built-in limbo (`crate::limbo`) is registered here too, but marked: plugins can't
+//! replace or remove it, and it isn't written back to the config.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -17,6 +20,7 @@ use crate::config::BackendConfig;
 #[derive(Clone, Default)]
 pub struct ServerRegistry {
     servers: Arc<RwLock<HashMap<String, BackendConfig>>>,
+    limbo: Arc<RwLock<Option<String>>>,
 }
 
 impl ServerRegistry {
@@ -24,6 +28,7 @@ impl ServerRegistry {
     pub fn new(servers: HashMap<String, BackendConfig>) -> Self {
         Self {
             servers: Arc::new(RwLock::new(servers)),
+            limbo: Arc::default(),
         }
     }
 
@@ -84,6 +89,31 @@ impl ServerRegistry {
     pub fn remove(&self, name: &str) -> Option<BackendConfig> {
         self.write().remove(name)
     }
+
+    /// Registers the built-in limbo under `name`.
+    pub fn set_limbo(&self, name: String, config: BackendConfig) {
+        self.write().insert(name.clone(), config);
+        *self.limbo.write().unwrap_or_else(PoisonError::into_inner) = Some(name);
+    }
+
+    /// The built-in limbo's name, if it runs.
+    #[must_use]
+    pub fn limbo(&self) -> Option<String> {
+        self.limbo
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether `name` is the built-in limbo, which plugins can't replace or remove.
+    #[must_use]
+    pub fn is_limbo(&self, name: &str) -> bool {
+        self.limbo
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            == Some(name)
+    }
 }
 
 impl From<HashMap<String, BackendConfig>> for ServerRegistry {
@@ -100,7 +130,13 @@ impl fmt::Debug for ServerRegistry {
 
 impl Serialize for ServerRegistry {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.read().serialize(serializer)
+        let limbo = self.limbo();
+        let guard = self.read();
+        let servers: HashMap<&String, &BackendConfig> = guard
+            .iter()
+            .filter(|(name, _)| Some(*name) != limbo.as_ref())
+            .collect();
+        servers.serialize(serializer)
     }
 }
 

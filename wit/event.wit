@@ -12,6 +12,7 @@ interface event {
         player-chat,
         player-command,
         plugin-message,
+        server-kick,
     }
 
     record proxy-ping-event {
@@ -91,6 +92,24 @@ interface event {
         cancelled: bool,
     }
 
+    /// A backend kicked the player, closed, crashed, or couldn't be reached. Fired before
+    /// Vine moves them; plugins pick where they go. Vine never disconnects for this.
+    record server-kick-event {
+        uuid: string,
+        username: string,
+        /// The server the player lost, or the one their first connect couldn't reach.
+        server-name: string,
+        /// The backend's kick message as legacy (§) text, if it sent one.
+        reason: option<string>,
+        /// True if the player wasn't on any server yet (their first connect failed).
+        initial: bool,
+        /// Set by plugins: where the player goes next. Vine tries it, then
+        /// `routing.fallback_server`, then its limbo. Unregistered names are skipped.
+        fallback-server: option<string>,
+        /// Set by plugins: what the player is told once moved (legacy text).
+        message: option<string>,
+    }
+
     variant event {
         proxy-ping(proxy-ping-event),
         player-pre-login(player-pre-login-event),
@@ -102,5 +121,6 @@ interface event {
         player-chat(player-chat-event),
         player-command(player-command-event),
         plugin-message(plugin-message-event),
+        server-kick(server-kick-event),
     }
 }

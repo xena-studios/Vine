@@ -557,6 +557,43 @@ impl PluginManager {
             }
         }
     }
+
+    /// Asks plugins where a player who lost their server goes, and what they're told.
+    pub async fn fire_server_kick(&self, event: &mut ServerKickEvent) {
+        use loader::wasm::wasm_host::wit::vine::plugin::event as wit_event;
+        let handlers = {
+            let map = self.event_handlers.read().await;
+            map.get(&EventType::ServerKick).cloned().unwrap_or_default()
+        };
+        for handler in handlers {
+            let wit_evt = wit_event::Event::ServerKick(wit_event::ServerKickEvent {
+                uuid: event.uuid.clone(),
+                username: event.username.clone(),
+                server_name: event.server_name.clone(),
+                reason: event.reason.clone(),
+                initial: event.initial,
+                fallback_server: event.fallback_server.clone(),
+                message: event.message.clone(),
+            });
+            match handler
+                .plugin
+                .handle_event(handler.handler_id, wit_evt)
+                .await
+            {
+                Ok(wit_event::Event::ServerKick(res)) => {
+                    event.fallback_server = res.fallback_server;
+                    event.message = res.message;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!(
+                        "Error in plugin '{}' handling ServerKick: {}",
+                        handler.plugin.metadata.name, e
+                    );
+                }
+            }
+        }
+    }
 }
 
 struct PluginCommandExecutor {

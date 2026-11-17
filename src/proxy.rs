@@ -17,6 +17,25 @@ use crate::session::SessionManager;
 use crate::status::{StatusHandler, StatusIconManager};
 use crate::telemetry;
 
+/// What players are told when the proxy they're on shuts down and can't transfer them.
+pub const SHUTDOWN_MESSAGE: &str = "This proxy is restarting. Reconnect to keep playing.";
+
+/// `host:port` (port 25565 if left out) from `routing.shutdown_transfer`.
+#[must_use]
+pub fn transfer_target(value: &str) -> Option<(String, u16)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !host.ends_with(':') => Some((
+            host.trim_matches(['[', ']']).to_string(),
+            port.parse().ok()?,
+        )),
+        _ => Some((value.to_string(), 25565)),
+    }
+}
+
 pub struct ProxyServer {
     config: Arc<Config>,
     keystore: Arc<KeyStore>,
@@ -91,6 +110,50 @@ impl ProxyServer {
         })
     }
 
+    /// Before stopping: sends every client that can take it (1.20.5+) to
+    /// `routing.shutdown_transfer` with the Transfer packet, so it reconnects through another
+    /// proxy, and disconnects the rest with [`SHUTDOWN_MESSAGE`]. Waits up to
+    /// `shutdown_timeout_secs` for them to go.
+    async fn empty_on_shutdown(&self) {
+        use crate::session::{PlayerAction, supports_transfer};
+        let sessions = self.session_manager.list_sessions();
+        if sessions.is_empty() {
+            return;
+        }
+        let target = self
+            .config
+            .routing
+            .shutdown_transfer
+            .as_deref()
+            .and_then(transfer_target);
+        let (mut transferred, mut disconnected) = (0, 0);
+        for session in sessions {
+            let action = match &target {
+                Some((host, port)) if supports_transfer(session.protocol_version) => {
+                    transferred += 1;
+                    PlayerAction::Transfer {
+                        host: host.clone(),
+                        port: *port,
+                    }
+                }
+                _ => {
+                    disconnected += 1;
+                    PlayerAction::Disconnect(SHUTDOWN_MESSAGE.to_string())
+                }
+            };
+            let _ = session.action_tx.send(action);
+        }
+        info!(
+            "Shutting down: transferring {} players, disconnecting {}",
+            transferred, disconnected
+        );
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.server.shutdown_timeout_secs.max(1));
+        while self.session_manager.count() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Run the proxy listener loop
     pub async fn run(
         &self,
@@ -98,6 +161,7 @@ impl ProxyServer {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let bind_addr = &self.config.server.bind_address;
         let listener = network::create_tcp_listener(bind_addr, &self.config.network)?;
+        crate::limbo::start(&self.config).await?;
 
         info!("=====================================================");
         info!("  Vine Minecraft Proxy is listening on {}", bind_addr);
@@ -321,6 +385,7 @@ impl ProxyServer {
         }
 
         info!("Vine proxy has stopped accepting connections.");
+        self.empty_on_shutdown().await;
 
         if self.config.plugins.enabled {
             info!("Unloading plugins...");
@@ -333,5 +398,25 @@ impl ProxyServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transfer_target;
+
+    #[test]
+    fn transfer_targets_parse() {
+        assert_eq!(
+            transfer_target("play.example.net:25577"),
+            Some(("play.example.net".into(), 25577))
+        );
+        assert_eq!(
+            transfer_target("play.example.net"),
+            Some(("play.example.net".into(), 25565))
+        );
+        assert_eq!(transfer_target("[::1]:25565"), Some(("::1".into(), 25565)));
+        assert_eq!(transfer_target("host:nope"), None);
+        assert_eq!(transfer_target(" "), None);
     }
 }

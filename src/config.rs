@@ -71,6 +71,9 @@ pub struct Config {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub plugins: PluginConfig,
+    /// The built-in limbo, where players wait when no backend can take them.
+    #[serde(default)]
+    pub limbo: crate::limbo::LimboConfig,
     /// Switches changed while the proxy runs. Not part of the file; shared by
     /// every clone of the config.
     #[serde(skip)]
@@ -265,6 +268,11 @@ pub struct RoutingConfig {
     /// Automatically try fallback server if connection to target server fails
     #[serde(default = "default_true")]
     pub try_fallback_on_connect_failure: bool,
+    /// `host:port` (the load balancer) that clients on 1.20.5 or newer are sent to with the
+    /// Transfer packet when the proxy shuts down, so they keep playing through another proxy.
+    /// Older clients are disconnected with a message to reconnect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_transfer: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -416,12 +424,14 @@ impl Default for Config {
                 fallback_server: Some("survival".to_string()),
                 forced_hosts,
                 try_fallback_on_connect_failure: true,
+                shutdown_transfer: None,
             },
             servers: servers.into(),
             telemetry: TelemetryConfig::default(),
             bedrock: crate::bedrock::BedrockConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginConfig::default(),
+            limbo: crate::limbo::LimboConfig::default(),
             runtime: RuntimeState::default(),
         }
     }

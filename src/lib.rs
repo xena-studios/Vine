@@ -5,6 +5,7 @@ pub mod client;
 pub mod command;
 pub mod config;
 pub mod legacy;
+pub mod limbo;
 pub mod network;
 pub mod permissions;
 pub mod plugin;

@@ -38,12 +38,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
     tokio::spawn(async move {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            error!("Failed to listen for shutdown signal: {}", err);
-        } else {
-            info!("Received shutdown signal (Ctrl+C). Initiating graceful shutdown...");
-            let _ = shutdown_tx.send(());
+        // Ctrl+C, or SIGTERM from `docker stop` and the like.
+        #[cfg(unix)]
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(err) => {
+                    error!("Failed to listen for SIGTERM: {}", err);
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(err) = result {
+                    error!("Failed to listen for shutdown signal: {}", err);
+                    return;
+                }
+                info!("Received shutdown signal (Ctrl+C). Initiating graceful shutdown...");
+            }
+            () = terminate => {
+                info!("Received SIGTERM. Initiating graceful shutdown...");
+            }
         }
+        let _ = shutdown_tx.send(());
     });
 
     if let Err(e) = server.run(shutdown_rx).await {

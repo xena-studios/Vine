@@ -35,7 +35,8 @@ interface proxy {
     register-server: func(name: string, address: string, forwarding: forwarding-mode, secret: option<string>) -> bool;
 
     /// Removes a backend server. Players on it stay connected; it can no longer
-    /// be picked for new connections or switches. Returns false if it wasn't registered.
+    /// be picked for new connections or switches. Returns false if it wasn't registered,
+    /// or if it is the built-in limbo (which `register-server` can't replace either).
     unregister-server: func(name: string) -> bool;
 
     /// Stops (true) or resumes (false) accepting new logins, so the proxy can be
@@ -44,6 +45,19 @@ interface proxy {
 
     /// Whether the proxy is refusing new logins.
     is-draining: func() -> bool;
+
+    /// Shows `message` (legacy text) above the player's hotbar.
+    send-action-bar: func(player-uuid: string, message: string) -> bool;
+
+    /// Shows a title; times in ticks.
+    send-title: func(player-uuid: string, title: string, subtitle: string, fade-in: u32, stay: u32, fade-out: u32) -> bool;
+
+    /// Sends the player to another address with the Transfer packet. False if the client is
+    /// older than 1.20.5 (no Transfer packet) or isn't online.
+    transfer-player: func(player-uuid: string, host: string, port: u16) -> bool;
+
+    /// The name of Vine's built-in limbo server, if it's on.
+    limbo-server: func() -> option<string>;
 
     /// Sends a plugin message / custom payload to a player.
     send-plugin-message: func(player-uuid: string, channel: string, data: list<u8>) -> bool;

@@ -37,6 +37,7 @@ pub enum EventType {
     PlayerChat,
     PlayerCommand,
     PluginMessage,
+    ServerKick,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +125,19 @@ pub struct PluginMessageEvent {
     pub player_uuid: Option<String>,
     pub server_name: Option<String>,
     pub cancelled: bool,
+}
+
+/// A backend kicked the player, closed, crashed or couldn't be reached. Plugins may set
+/// `fallback_server` and `message`.
+#[derive(Debug, Clone)]
+pub struct ServerKickEvent {
+    pub uuid: String,
+    pub username: String,
+    pub server_name: String,
+    pub reason: Option<String>,
+    pub initial: bool,
+    pub fallback_server: Option<String>,
+    pub message: Option<String>,
 }
 
 pub struct PluginContext {

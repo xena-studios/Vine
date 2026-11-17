@@ -18,6 +18,25 @@ pub enum PlayerAction {
     Disconnect(String),
     /// Send a custom plugin message / payload to the player
     PluginMessage { channel: String, data: Vec<u8> },
+    /// Show text above the hotbar
+    ActionBar(TextComponent),
+    /// Show a title; times in ticks
+    Title {
+        title: TextComponent,
+        subtitle: TextComponent,
+        fade_in: i32,
+        stay: i32,
+        fade_out: i32,
+    },
+}
+
+/// Protocol version of 1.20.5, the first with the Transfer packet.
+pub const TRANSFER_PROTOCOL: u32 = 766;
+
+/// Whether a client on `protocol_version` understands the Transfer packet.
+#[must_use]
+pub fn supports_transfer(protocol_version: u32) -> bool {
+    protocol_version >= TRANSFER_PROTOCOL
 }
 
 /// Represents an active connected player session on the proxy
